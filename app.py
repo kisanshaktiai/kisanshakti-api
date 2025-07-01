@@ -1,6 +1,8 @@
 import ee
 import os
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+
 
 # Initialize Earth Engine with service account credentials
 SERVICE_ACCOUNT = 'kisanshaktiai-n@exalted-legacy-456511-b9.iam.gserviceaccount.com'
