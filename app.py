@@ -1,9 +1,8 @@
-
 import ee
 import os
 from flask import Flask, request, jsonify
 
-# ✅ Use service account from Render secret path
+# Initialize Earth Engine with service account credentials
 SERVICE_ACCOUNT = 'kisanshaktiai-n@exalted-legacy-456511-b9.iam.gserviceaccount.com'
 CREDENTIALS_PATH = '/etc/secrets/credentials.json'
 
@@ -12,17 +11,30 @@ ee.Initialize(credentials)
 
 app = Flask(__name__)
 
-# ✅ Use shared SoilGrids image with band selection
-def get_soil_value(lat, lon, band_name):
+# Try to get first available depth from multiple bands
+def get_soil_value(lat, lon, image_id_prefix):
     try:
         point = ee.Geometry.Point([lon, lat])
-        image = ee.Image("projects/soilgrids-isric/soilgrids_mean").select(band_name)
-        sample = image.sample(region=point, scale=250).first()
-        if sample:
-            props = sample.getInfo().get('properties', {})
-            return list(props.values())[0]
-        else:
-            return None
+        region = point.buffer(300).bounds()
+
+        # Depth priority
+        depths = ["0-5cm", "5-15cm", "15-30cm", "30-60cm", "60-100cm", "100-200cm"]
+
+        for depth in depths:
+            band_name = f"{image_id_prefix}_{depth}_mean"
+            try:
+                image = ee.Image(f"projects/soilgrids-isric/{image_id_prefix}_mean")
+                value = image.select(band_name).reduceRegion(
+                    reducer=ee.Reducer.first(),
+                    geometry=region,
+                    scale=250
+                ).getInfo()
+                if value and band_name in value and value[band_name] is not None:
+                    return round(float(value[band_name]), 2)
+            except Exception:
+                continue
+
+        return "No data"
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -35,23 +47,23 @@ def soil_data():
         return jsonify({'error': 'lat and lon are required'}), 400
 
     layers = {
-        "ph": "phh2o_0-5cm_mean",
-        "organic_carbon": "ocd_0-5cm_mean",
-        "clay": "clay_0-5cm_mean",
-        "sand": "sand_0-5cm_mean",
-        "silt": "silt_0-5cm_mean",
-        "bulk_density": "bdod_0-5cm_mean",
-        "cec": "cec_0-5cm_mean"
+        "ph": "phh2o",
+        "organic_carbon": "ocd",
+        "clay": "clay",
+        "sand": "sand",
+        "silt": "silt",
+        "bulk_density": "bdod",
+        "cec": "cec"
     }
 
     result = {
         "latitude": lat,
         "longitude": lon,
-        "depth": "0–5 cm"
+        "method": "buffered fallback from 0–5cm downward"
     }
 
-    for key, band in layers.items():
-        result[key] = get_soil_value(lat, lon, band) or "N/A"
+    for key, prefix in layers.items():
+        result[key] = get_soil_value(lat, lon, prefix)
 
     return jsonify(result)
 
