@@ -2,14 +2,17 @@ import ee
 import os
 from flask import Flask, request, jsonify
 
-# Load GEE credentials (Render stores this as env var or uploaded file)
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = "/etc/secrets/credentials.json"
+# ✅ Service account credentials
+SERVICE_ACCOUNT = 'kisanshaktiai-n@exalted-legacy-456511-b9.iam.gserviceaccount.com'
+CREDENTIALS_PATH = '/etc/secrets/credentials.json'
 
-# Initialize Earth Engine
-ee.Initialize()
+# ✅ Authenticate using service account
+credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, key_file=CREDENTIALS_PATH)
+ee.Initialize(credentials)
 
 app = Flask(__name__)
 
+# Utility to get a soil property value from GEE
 def get_soil_value(lat, lon, image_id):
     try:
         point = ee.Geometry.Point([lon, lat])
@@ -28,7 +31,7 @@ def soil_data():
     lat = request.args.get('lat', type=float)
     lon = request.args.get('lon', type=float)
 
-    if not lat or not lon:
+    if lat is None or lon is None:
         return jsonify({'error': 'lat and lon are required'}), 400
 
     layers = {
@@ -41,11 +44,14 @@ def soil_data():
         "cec": 'projects/soilgrids-isric/cec_0-5cm_mean'
     }
 
-    result = {"latitude": lat, "longitude": lon, "depth": "0–5 cm"}
+    result = {
+        "latitude": lat,
+        "longitude": lon,
+        "depth": "0–5 cm"
+    }
 
     for key, image_id in layers.items():
-        value = get_soil_value(lat, lon, image_id)
-        result[key] = value if value is not None else "N/A"
+        result[key] = get_soil_value(lat, lon, image_id) or "N/A"
 
     return jsonify(result)
 
