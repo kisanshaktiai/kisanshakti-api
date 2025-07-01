@@ -3,8 +3,7 @@ import os
 from flask import Flask, request, jsonify
 
 # Load GEE credentials (Render stores this as env var or uploaded file)
-CREDENTIALS_PATH = "/etc/secrets/credentials.json"
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_PATH
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = "/etc/secrets/credentials.json"
 
 # Initialize Earth Engine
 ee.Initialize()
