@@ -10,6 +10,7 @@ credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, key_file=CREDENTIALS
 ee.Initialize(credentials)
 
 app = Flask(__name__)
+CORS(app)
 
 # Try to get first available depth from multiple bands
 def get_soil_value(lat, lon, image_id_prefix):
