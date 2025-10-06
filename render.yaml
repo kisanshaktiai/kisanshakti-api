@@ -1,4 +1,5 @@
 services:
+  # 🌱 FastAPI Web Service
   - type: web
     name: kisanshakti-soil-api
     env: python
@@ -8,3 +9,15 @@ services:
     envVars:
       - key: GOOGLE_APPLICATION_CREDENTIALS
         value: credentials.json
+      - fromGroup: api-env   # 👈 attach your existing API env group
+
+  # 🛰️ Tile Fetch Worker (Cron Job)
+  - type: cron
+    name: tile-fetch-worker
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python tile_fetch_worker.py
+    schedule: "0 20 * * *"  # runs every day at 2 AM IST (20:00 UTC)
+    envVars:
+      - fromGroup: sentinel-fetch-env  # 👈 attach worker env group
