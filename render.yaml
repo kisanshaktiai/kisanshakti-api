@@ -1,7 +1,7 @@
 services:
   # 🌱 FastAPI Web Service
   - type: web
-    name: kisanshakti-soil-api
+    name: kisanshakti-api
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -31,3 +31,4 @@ services:
     schedule: "30 20 * * *"   # runs daily at 2:30 AM IST (20:30 UTC), after tile fetch
     envVars:
       - fromGroup: sentinel-fetch-env   # same group, needs Supabase + B2
+
