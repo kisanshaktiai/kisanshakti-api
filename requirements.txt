@@ -1,7 +1,21 @@
+# Web Framework
+fastapi
+uvicorn
+
+# Optional (if still using Flask for other APIs)
 flask
 flask-cors
-earthengine-api
+
+# Supabase + B2
 supabase
 b2sdk
 requests
 
+# Satellite / Raster Processing
+shapely
+rio-tiler
+mercantile
+Pillow
+
+# Google Earth Engine (if needed in future steps)
+earthengine-api
