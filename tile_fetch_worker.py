@@ -2,6 +2,8 @@ import os, requests, json, datetime, tempfile, logging, traceback
 from supabase import create_client
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
 from requests.adapters import HTTPAdapter, Retry
+from shapely import wkb
+from shapely.geometry import mapping  # shapely -> GeoJSON dict
 
 # ---------------- Config ----------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -40,7 +42,7 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ---------------- Helpers ----------------
 def fetch_agri_tiles():
-    """Get MGRS tiles where is_agri=True"""
+    """Get MGRS tiles where is_agri=True (geometry is WKB hex)"""
     try:
         resp = supabase.table("mgrs_tiles").select("tile_id, geometry").eq("is_agri", True).execute()
         if not resp.data:
@@ -52,10 +54,24 @@ def fetch_agri_tiles():
         return []
 
 
-def query_mpc(tile_geom, start_date, end_date):
+def decode_wkb_to_geojson(wkb_hex):
+    """Convert PostGIS WKB hex → GeoJSON dict"""
+    try:
+        geom = wkb.loads(bytes.fromhex(wkb_hex))  # shapely geometry
+        return mapping(geom)  # GeoJSON dict
+    except Exception as e:
+        logging.error(f"Failed to decode WKB: {e}\n{traceback.format_exc()}")
+        return None
+
+
+def query_mpc(tile_geom_wkb, start_date, end_date):
     """Query MPC for Sentinel-2 scenes intersecting tile geometry"""
     try:
-        geom_json = json.loads(tile_geom) if isinstance(tile_geom, str) else tile_geom
+        geom_json = decode_wkb_to_geojson(tile_geom_wkb)
+        if not geom_json:
+            logging.warning("Geometry decode failed, skipping tile")
+            return []
+
         body = {
             "collections": [MPC_COLLECTION],
             "intersects": geom_json,
@@ -117,14 +133,14 @@ def pick_best_scene(scenes):
 def process_tile(tile):
     """Process a single tile: query MPC, download bands, store in Supabase"""
     tile_id = tile["tile_id"]
-    geom = tile["geometry"]
+    geom_wkb = tile["geometry"]
 
     today = datetime.date.today()
     start_date = (today - datetime.timedelta(days=LOOKBACK_DAYS)).isoformat()
     end_date = today.isoformat()
 
     try:
-        scenes = query_mpc(geom, start_date, end_date)
+        scenes = query_mpc(geom_wkb, start_date, end_date)
         if not scenes:
             logging.info(f"No scenes found for tile {tile_id}")
             return
