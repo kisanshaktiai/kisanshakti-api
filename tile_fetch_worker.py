@@ -9,9 +9,10 @@ from shapely.geometry import mapping  # shapely -> GeoJSON dict
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")
-B2_APP_KEY = os.environ.get("B2_KEY")
-B2_BUCKET_NAME = "kisanshakti-ndvi-tiles"  # fixed bucket name
+B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")   # ✅ matches Render
+B2_APP_KEY = os.environ.get("B2_APP_KEY")     # ✅ fix this line
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET_RAW", "kisanshakti-ndvi-tiles")
+B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")   # optional prefix
 
 MPC_STAC = os.environ.get("MPC_STAC_BASE", "https://planetarycomputer.microsoft.com/api/stac/v1/search")
 MPC_COLLECTION = os.environ.get("MPC_COLLECTION", "sentinel-2-l2a")
@@ -156,3 +157,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
