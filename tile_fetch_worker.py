@@ -321,13 +321,13 @@ def process_tile(tile):
         }
 
         try:
-    resp = supabase.table("satellite_tiles") \
-        .upsert(payload, on_conflict=["tile_id", "acquisition_date", "collection"]) \
-        .execute()
-    logging.info(f"✅ Upserted {tile_id} {acq_date}, payload={payload}")
-    logging.info(f"📦 Supabase raw response: {resp}")
-except Exception as db_err:
-    logging.error(f"❌ Supabase upsert failed for {tile_id} {acq_date}: {db_err}\nPayload={payload}")
+            resp = supabase.table("satellite_tiles") \
+                .upsert(payload, on_conflict=["tile_id", "acquisition_date", "collection"]) \
+                .execute()
+            logging.info(f"✅ Upserted {tile_id} {acq_date}, payload={payload}")
+            logging.info(f"📦 Supabase raw response: {resp}")
+        except Exception as db_err:
+            logging.error(f"❌ Supabase upsert failed for {tile_id} {acq_date}: {db_err}\nPayload={payload}")
 
         return True
 
@@ -352,6 +352,7 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
 
 
 
