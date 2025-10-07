@@ -21,18 +21,18 @@ def health_check():
 @app.post("/run")
 async def run_worker(request: Request):
     try:
-        # Get JSON body
         body = await request.json()
         cloud_cover = body.get("cloud_cover", 30)     # default 30%
         lookback_days = body.get("lookback_days", 5)  # default 5 days
 
         logging.info(f"Running worker with cloud_cover={cloud_cover}, lookback_days={lookback_days}")
-        tile_fetch_worker.main(cloud_cover=cloud_cover, lookback_days=lookback_days)
+        processed_count = tile_fetch_worker.main(cloud_cover=cloud_cover, lookback_days=lookback_days)
 
         return {
             "status": "success",
             "cloud_cover": cloud_cover,
-            "lookback_days": lookback_days
+            "lookback_days": lookback_days,
+            "processed_tiles": processed_count
         }
     except Exception as e:
         logging.error(f"Worker failed: {e}")
