@@ -16,7 +16,7 @@ B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")   # optional prefix
 
 MPC_STAC = os.environ.get("MPC_STAC_BASE", "https://planetarycomputer.microsoft.com/api/stac/v1/search")
 MPC_COLLECTION = os.environ.get("MPC_COLLECTION", "sentinel-2-l2a")
-CLOUD_COVER = int(os.environ.get("DEFAULT_CLOUD_COVER_MAX", "30"))
+CLOUD_COVER = int(os.environ.get("DEFAULT_CLOUD_COVER_MAX", "20"))
 LOOKBACK_DAYS = int(os.environ.get("MAX_SCENE_LOOKBACK_DAYS", "5"))
 
 # ---------------- Logging ----------------
@@ -157,10 +157,15 @@ def process_tile(tile):
         logging.info(f"✅ Stored {tile_id} {acq_date}")
 
 
-def main():
+def main(cloud_cover=20, lookback_days=5):
+    global CLOUD_COVER, LOOKBACK_DAYS
+    CLOUD_COVER = cloud_cover
+    LOOKBACK_DAYS = lookback_days
+
     for t in fetch_agri_tiles():
         process_tile(t)
 
 
 if __name__ == "__main__":
     main()
+
