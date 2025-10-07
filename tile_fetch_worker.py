@@ -9,8 +9,8 @@ from shapely.geometry import mapping  # shapely -> GeoJSON dict
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")   # ✅ matches Render
-B2_APP_KEY = os.environ.get("B2_APP_KEY")     # ✅ fix this line
+B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")
+B2_APP_KEY = os.environ.get("B2_APP_KEY")
 B2_BUCKET_NAME = os.environ.get("B2_BUCKET_RAW", "kisanshakti-ndvi-tiles")
 B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")   # optional prefix
 
@@ -46,18 +46,25 @@ def fetch_agri_tiles():
         return []
 
 
-def decode_wkb_to_geojson(wkb_hex):
+def decode_geom_to_geojson(geom_value):
+    """Handle geometry from Supabase (either WKB hex string or GeoJSON dict)"""
     try:
-        geom = wkb.loads(bytes.fromhex(wkb_hex))
-        return mapping(geom)
+        if isinstance(geom_value, str):  # WKB hex
+            geom = wkb.loads(bytes.fromhex(geom_value))
+            return mapping(geom)
+        elif isinstance(geom_value, dict):  # already GeoJSON
+            return geom_value
+        else:
+            logging.error(f"Unexpected geometry type: {type(geom_value)}")
+            return None
     except Exception as e:
-        logging.error(f"Failed to decode WKB: {e}\n{traceback.format_exc()}")
+        logging.error(f"Failed to decode geometry: {e}\n{traceback.format_exc()}")
         return None
 
 
-def query_mpc(tile_geom_wkb, start_date, end_date):
+def query_mpc(tile_geom, start_date, end_date):
     try:
-        geom_json = decode_wkb_to_geojson(tile_geom_wkb)
+        geom_json = decode_geom_to_geojson(tile_geom)
         if not geom_json:
             return []
 
@@ -112,13 +119,13 @@ def pick_best_scene(scenes):
 
 def process_tile(tile):
     tile_id = tile["tile_id"]
-    geom_wkb = tile["geometry"]
+    geom_value = tile["geometry"]
 
     today = datetime.date.today()
     start_date = (today - datetime.timedelta(days=LOOKBACK_DAYS)).isoformat()
     end_date = today.isoformat()
 
-    scenes = query_mpc(geom_wkb, start_date, end_date)
+    scenes = query_mpc(geom_value, start_date, end_date)
     if not scenes:
         logging.info(f"No scenes for {tile_id}")
         return
@@ -134,8 +141,8 @@ def process_tile(tile):
     if not red_url or not nir_url:
         return
 
-    red_b2 = download_to_b2(red_url, f"tiles/raw/{tile_id}/{acq_date}/B04.tif")
-    nir_b2 = download_to_b2(nir_url, f"tiles/raw/{tile_id}/{acq_date}/B08.tif")
+    red_b2 = download_to_b2(red_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif")
+    nir_b2 = download_to_b2(nir_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif")
 
     if red_b2 and nir_b2:
         supabase.table("satellite_tiles").upsert({
@@ -157,4 +164,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
