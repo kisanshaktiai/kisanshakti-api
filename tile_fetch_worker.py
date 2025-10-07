@@ -3,7 +3,7 @@ from supabase import create_client
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
 from requests.adapters import HTTPAdapter, Retry
 from shapely import wkb, wkt
-from shapely.geometry import mapping  # shapely -> GeoJSON dict
+from shapely.geometry import mapping
 import planetary_computer as pc
 import rasterio
 import numpy as np
@@ -15,7 +15,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")
 B2_APP_KEY = os.environ.get("B2_APP_KEY")
 B2_BUCKET_NAME = os.environ.get("B2_BUCKET_RAW", "kisanshakti-ndvi-tiles")
-B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")   # optional prefix
+B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")
 
 MPC_STAC = os.environ.get("MPC_STAC_BASE", "https://planetarycomputer.microsoft.com/api/stac/v1/search")
 MPC_COLLECTION = os.environ.get("MPC_COLLECTION", "sentinel-2-l2a")
@@ -45,10 +45,10 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ---------------- Helpers ----------------
 def fetch_agri_tiles():
-    """Get MGRS tiles where is_agri=True"""
+    """Get MGRS tiles where is_agri=True, including country_id"""
     try:
         resp = supabase.table("mgrs_tiles") \
-            .select("tile_id, geometry") \
+            .select("tile_id, geometry, country_id, id") \
             .eq("is_agri", True) \
             .execute()
         tiles = resp.data or []
@@ -122,32 +122,6 @@ def _signed_asset_url(assets, primary_key, fallback_key=None):
     except:
         return href
 
-def compress_and_upload(local_path, b2_key):
-    """Compress a raster to LZW COG and upload to B2"""
-    compressed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
-    try:
-        with rasterio.open(local_path) as src:
-            data = src.read()
-            meta = src.meta.copy()
-            meta.update(
-                compress="LZW",        # lossless compression
-                tiled=True,            # cloud-optimized layout
-                blockxsize=512,
-                blockysize=512
-            )
-            with rasterio.open(compressed_tmp.name, "w", **meta) as dst:
-                dst.write(data)
-
-        logging.info(f"Uploading compressed COG to B2: {B2_BUCKET_NAME}/{b2_key}")
-        bucket.upload_local_file(local_file=compressed_tmp.name, file_name=b2_key)
-        return f"b2://{B2_BUCKET_NAME}/{b2_key}"
-    except Exception as e:
-        logging.error(f"Compression/upload failed: {e}\n{traceback.format_exc()}")
-        return None
-    finally:
-        try: os.remove(compressed_tmp.name)
-        except: pass
-
 def download_band(url, b2_path):
     """Download band → compress → upload → return compressed local + b2_uri"""
     raw_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
@@ -179,7 +153,6 @@ def download_band(url, b2_path):
         logging.info(f"Uploading compressed COG to B2: {B2_BUCKET_NAME}/{b2_path}")
         bucket.upload_local_file(local_file=compressed_tmp.name, file_name=b2_path)
 
-        # Return path to compressed local file (safe for rasterio open)
         return compressed_tmp.name, f"b2://{B2_BUCKET_NAME}/{b2_path}"
 
     except Exception as e:
@@ -188,7 +161,6 @@ def download_band(url, b2_path):
     finally:
         try: os.remove(raw_tmp.name)
         except: pass
-        # ⚠️ do NOT delete compressed_tmp.name, because compute_and_upload_ndvi still needs it
 
 def _record_exists(tile_id, acq_date):
     try:
@@ -200,7 +172,8 @@ def _record_exists(tile_id, acq_date):
             .limit(1).execute()
         rows = resp.data or []
         return (True, rows[0]) if rows else (False, None)
-    except:
+    except Exception as e:
+        logging.error(f"Error checking record existence: {e}")
         return False, None
 
 def pick_best_scene(scenes):
@@ -219,6 +192,7 @@ def pick_best_scene(scenes):
 
 # ---------- NDVI Calculation ----------
 def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
+    """Compute NDVI and upload to B2, return B2 URI and stats"""
     ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
         with rasterio.open(red_local) as rsrc, rasterio.open(nir_local) as nsrc:
@@ -231,7 +205,15 @@ def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
         ndvi = np.where((nir + red) == 0, np.nan, ndvi)
 
         valid = ~np.isnan(ndvi)
-        stats = {}
+        stats = {
+            "ndvi_min": None,
+            "ndvi_max": None,
+            "ndvi_mean": None,
+            "ndvi_std_dev": None,
+            "vegetation_coverage_percent": None,
+            "data_completeness_percent": None
+        }
+        
         if valid.sum() > 0:
             stats = {
                 "ndvi_min": float(np.nanmin(ndvi)),
@@ -249,15 +231,21 @@ def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
         ndvi_b2_path = f"{B2_PREFIX}ndvi/{tile_id}/{acq_date}/ndvi.tif"
         bucket.upload_local_file(local_file=ndvi_tmp.name, file_name=ndvi_b2_path)
         return f"b2://{B2_BUCKET_NAME}/{ndvi_b2_path}", stats
+    except Exception as e:
+        logging.error(f"NDVI computation failed: {e}\n{traceback.format_exc()}")
+        return None, None
     finally:
         try: os.remove(ndvi_tmp.name)
         except: pass
 
 # ---------------- Main process ----------------
 def process_tile(tile):
+    """Process a single tile: fetch scene, download bands, compute NDVI, save to DB"""
     try:
         tile_id = tile["tile_id"]
         geom_value = tile["geometry"]
+        country_id = tile.get("country_id")  # Get country_id from mgrs_tiles
+        mgrs_tile_id = tile.get("id")  # Get mgrs_tiles.id
 
         today = datetime.date.today()
         start_date = (today - datetime.timedelta(days=LOOKBACK_DAYS)).isoformat()
@@ -274,6 +262,8 @@ def process_tile(tile):
             return False
 
         acq_date = scene["properties"]["datetime"].split("T")[0]
+        cloud_cover = scene["properties"].get("eo:cloud_cover")
+        
         exists, row = _record_exists(tile_id, acq_date)
         if exists and row and row.get("status") in ("downloaded", "ready"):
             logging.info(f"⏩ Skipping {tile_id} {acq_date}, already in DB with status={row.get('status')}")
@@ -287,26 +277,33 @@ def process_tile(tile):
             logging.warning(f"❌ Missing red/nir URLs for {tile_id} {acq_date}")
             return False
 
-        # download + compress + upload Red/NIR
+        # Download + compress + upload Red/NIR
+        logging.info(f"📥 Downloading Red band for {tile_id} {acq_date}")
         red_local, red_b2 = download_band(red_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif")
+        
+        logging.info(f"📥 Downloading NIR band for {tile_id} {acq_date}")
         nir_local, nir_b2 = download_band(nir_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif")
+        
         if not red_local or not nir_local:
             logging.error(f"❌ Failed to download/compress Red or NIR for {tile_id}")
             return False
 
-        # compute NDVI (compressed)
+        # Compute NDVI
+        logging.info(f"🧮 Computing NDVI for {tile_id} {acq_date}")
         ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
-        if not ndvi_b2:
-            logging.error(f"❌ Failed NDVI computation for {tile_id}")
-            return False
-
-        # cleanup temp Red/NIR after NDVI is done
+        
+        # Cleanup temp Red/NIR after NDVI is done
         try:
             os.remove(red_local)
             os.remove(nir_local)
         except Exception:
             pass
 
+        if not ndvi_b2 or stats is None:
+            logging.error(f"❌ Failed NDVI computation for {tile_id}")
+            return False
+
+        # Prepare payload with all required fields including country_id
         payload = {
             "tile_id": tile_id,
             "acquisition_date": acq_date,
@@ -317,42 +314,94 @@ def process_tile(tile):
             "status": "ready",
             "api_source": "planetary_computer",
             "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
-            **stats
+            "processing_method": "cog_streaming",
+            "actual_download_status": "downloaded",
+            "processing_stage": "completed",
+            "ndvi_calculation_timestamp": datetime.datetime.utcnow().isoformat() + "Z"
         }
+        
+        # Add country_id and mgrs_tile_id (CRITICAL for foreign key constraint)
+        if country_id:
+            payload["country_id"] = country_id
+        if mgrs_tile_id:
+            payload["mgrs_tile_id"] = mgrs_tile_id
+            
+        # Add cloud_cover if available
+        if cloud_cover is not None:
+            payload["cloud_cover"] = float(cloud_cover)
+        
+        # Add stats only if they exist
+        if stats:
+            payload.update(stats)
 
+        # Insert/Update record in Supabase
+        logging.info(f"💾 Saving record to database for {tile_id} {acq_date}")
+        logging.debug(f"Payload keys: {list(payload.keys())}")
+        
         try:
+            # Use upsert with proper conflict handling
             resp = supabase.table("satellite_tiles") \
-                .upsert(payload, on_conflict=["tile_id", "acquisition_date", "collection"]) \
+                .upsert(payload, on_conflict="tile_id,acquisition_date,collection") \
                 .execute()
-            logging.info(f"✅ Upserted {tile_id} {acq_date}, payload={payload}")
-            logging.info(f"📦 Supabase raw response: {resp}")
+            
+            if resp.data:
+                logging.info(f"✅ Successfully saved {tile_id} {acq_date} (record id: {resp.data[0].get('id')})")
+            else:
+                logging.warning(f"⚠️ Upsert returned no data for {tile_id} {acq_date}")
+            
+            logging.debug(f"📦 Supabase response: {resp}")
+            
         except Exception as db_err:
-            logging.error(f"❌ Supabase upsert failed for {tile_id} {acq_date}: {db_err}\nPayload={payload}")
+            error_msg = str(db_err)
+            logging.error(f"❌ Database operation failed for {tile_id} {acq_date}")
+            logging.error(f"Error: {error_msg}")
+            
+            # Log specific constraint violations
+            if "foreign key" in error_msg.lower():
+                logging.error(f"⚠️ Foreign key constraint violation - country_id: {country_id}, mgrs_tile_id: {mgrs_tile_id}")
+            if "unique" in error_msg.lower():
+                logging.error(f"⚠️ Unique constraint violation - may be duplicate record")
+            
+            logging.error(f"Payload: {json.dumps(payload, indent=2, default=str)}")
+            return False
 
         return True
 
     except Exception as e:
-        logging.error(f"process_tile error for {tile.get('tile_id')}: {e}\n{traceback.format_exc()}")
+        logging.error(f"❌ process_tile error for {tile.get('tile_id')}: {e}")
+        logging.error(traceback.format_exc())
         return False
 
 def main(cloud_cover=20, lookback_days=5):
+    """Main entry point"""
     global CLOUD_COVER, LOOKBACK_DAYS
     CLOUD_COVER = int(cloud_cover)
     LOOKBACK_DAYS = int(lookback_days)
 
+    logging.info(f"🚀 Starting tile processing (cloud_cover<={CLOUD_COVER}%, lookback={LOOKBACK_DAYS} days)")
+    
     processed = 0
     tiles = fetch_agri_tiles()
-    for t in tiles:
+    
+    if not tiles:
+        logging.warning("⚠️ No tiles fetched from database")
+        return 0
+    
+    logging.info(f"📋 Processing {len(tiles)} tiles...")
+    
+    for i, t in enumerate(tiles, 1):
+        tile_id = t.get('tile_id', 'unknown')
+        logging.info(f"🔄 [{i}/{len(tiles)}] Processing: {tile_id}")
         if process_tile(t):
             processed += 1
-    logging.info(f"Finished: processed {processed}/{len(tiles)} tiles")
+            logging.info(f"✅ [{i}/{len(tiles)}] Success: {tile_id}")
+        else:
+            logging.info(f"⏭️  [{i}/{len(tiles)}] Skipped: {tile_id}")
+    
+    logging.info(f"✨ Finished: processed {processed}/{len(tiles)} tiles successfully")
     return processed
 
 if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
-
-
-
-
