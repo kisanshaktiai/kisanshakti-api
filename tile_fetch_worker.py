@@ -198,12 +198,41 @@ def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
         logging.info(f"📂 Opening Red band: {red_local}")
         logging.info(f"📂 Opening NIR band: {nir_local}")
         
+        # Open with windowed reading to reduce memory usage
         with rasterio.open(red_local) as rsrc, rasterio.open(nir_local) as nsrc:
-            red = rsrc.read(1).astype("float32")
-            nir = nsrc.read(1).astype("float32")
+            # Get dimensions
+            height = rsrc.height
+            width = rsrc.width
+            logging.info(f"📐 Image dimensions: {width} x {height}")
+            
+            # Read with downsampling factor to reduce memory
+            out_shape = (height // 2, width // 2)  # Downsample by 2x
+            logging.info(f"📉 Downsampling to: {out_shape[1]} x {out_shape[0]}")
+            
+            red = rsrc.read(
+                1, 
+                out_shape=out_shape,
+                resampling=rasterio.enums.Resampling.average
+            ).astype("float32")
+            
+            nir = nsrc.read(
+                1,
+                out_shape=out_shape, 
+                resampling=rasterio.enums.Resampling.average
+            ).astype("float32")
+            
             meta = rsrc.meta.copy()
+            # Update metadata for downsampled size
+            meta.update({
+                'height': out_shape[0],
+                'width': out_shape[1],
+                'transform': rsrc.transform * rsrc.transform.scale(
+                    (rsrc.width / out_shape[1]),
+                    (rsrc.height / out_shape[0])
+                )
+            })
         
-        logging.info(f"✅ Bands loaded. Shape: {red.shape}")
+        logging.info(f"✅ Bands loaded. Shape: {red.shape}, Memory: ~{red.nbytes / 1024 / 1024:.1f}MB")
 
         np.seterr(divide="ignore", invalid="ignore")
         ndvi = (nir - red) / (nir + red)
@@ -328,6 +357,7 @@ def process_tile(tile):
         logging.info(f"✅ NDVI ready for {tile_id} {acq_date}")
 
         # Prepare payload with all required fields including country_id
+        logging.info(f"📝 Preparing database payload for {tile_id} {acq_date}")
         payload = {
             "tile_id": tile_id,
             "acquisition_date": acq_date,
@@ -347,48 +377,70 @@ def process_tile(tile):
         # Add country_id and mgrs_tile_id (CRITICAL for foreign key constraint)
         if country_id:
             payload["country_id"] = country_id
+            logging.info(f"✅ Added country_id: {country_id}")
+        else:
+            logging.warning(f"⚠️ No country_id for tile {tile_id}")
+            
         if mgrs_tile_id:
             payload["mgrs_tile_id"] = mgrs_tile_id
+            logging.info(f"✅ Added mgrs_tile_id: {mgrs_tile_id}")
+        else:
+            logging.warning(f"⚠️ No mgrs_tile_id for tile {tile_id}")
             
         # Add cloud_cover if available
         if cloud_cover is not None:
             payload["cloud_cover"] = float(cloud_cover)
+            logging.info(f"☁️  Cloud cover: {cloud_cover}%")
         
         # Add stats only if they exist
         if stats:
             payload.update(stats)
+            logging.info(f"📊 Added NDVI stats to payload")
 
         # Insert/Update record in Supabase
         logging.info(f"💾 Saving record to database for {tile_id} {acq_date}")
-        logging.debug(f"Payload keys: {list(payload.keys())}")
+        logging.info(f"📋 Payload fields: {', '.join(payload.keys())}")
+        logging.debug(f"📄 Full payload: {json.dumps(payload, indent=2, default=str)}")
         
         try:
             # Use upsert with proper conflict handling
+            logging.info(f"🔄 Executing upsert operation...")
             resp = supabase.table("satellite_tiles") \
                 .upsert(payload, on_conflict="tile_id,acquisition_date,collection") \
                 .execute()
             
+            logging.info(f"✅ Upsert operation completed")
+            
             if resp.data:
-                logging.info(f"✅ Successfully saved {tile_id} {acq_date} (record id: {resp.data[0].get('id')})")
+                record_id = resp.data[0].get('id', 'unknown')
+                logging.info(f"✅ Successfully saved {tile_id} {acq_date} (record id: {record_id})")
+                logging.info(f"📦 Response data: {resp.data[0]}")
             else:
                 logging.warning(f"⚠️ Upsert returned no data for {tile_id} {acq_date}")
-            
-            logging.debug(f"📦 Supabase response: {resp}")
+                logging.warning(f"📦 Full response: {resp}")
             
         except Exception as db_err:
             error_msg = str(db_err)
             logging.error(f"❌ Database operation failed for {tile_id} {acq_date}")
-            logging.error(f"Error: {error_msg}")
+            logging.error(f"💥 Error type: {type(db_err).__name__}")
+            logging.error(f"💥 Error message: {error_msg}")
             
             # Log specific constraint violations
             if "foreign key" in error_msg.lower():
-                logging.error(f"⚠️ Foreign key constraint violation - country_id: {country_id}, mgrs_tile_id: {mgrs_tile_id}")
+                logging.error(f"⚠️ Foreign key constraint violation!")
+                logging.error(f"   tile_id: {tile_id}")
+                logging.error(f"   country_id: {country_id}")
+                logging.error(f"   mgrs_tile_id: {mgrs_tile_id}")
             if "unique" in error_msg.lower():
                 logging.error(f"⚠️ Unique constraint violation - may be duplicate record")
+            if "null value" in error_msg.lower():
+                logging.error(f"⚠️ NULL value constraint violation")
             
-            logging.error(f"Payload: {json.dumps(payload, indent=2, default=str)}")
+            logging.error(f"📄 Failed payload:\n{json.dumps(payload, indent=2, default=str)}")
+            logging.error(f"🔍 Full traceback:\n{traceback.format_exc()}")
             return False
 
+        logging.info(f"🎉 Record successfully saved for {tile_id} {acq_date}")
         return True
 
     except Exception as e:
