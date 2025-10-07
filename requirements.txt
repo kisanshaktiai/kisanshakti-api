@@ -18,7 +18,10 @@ mercantile
 Pillow
 planetary-computer
 pystac-client
+rasterio
+numpy
 
 # Google Earth Engine (if needed in future steps)
 earthengine-api
+
 
