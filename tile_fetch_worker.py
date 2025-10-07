@@ -45,6 +45,7 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ---------------- Helpers ----------------
 def fetch_agri_tiles():
+    """Get MGRS tiles where is_agri=True"""
     try:
         resp = supabase.table("mgrs_tiles") \
             .select("tile_id, geometry") \
@@ -58,6 +59,7 @@ def fetch_agri_tiles():
         return []
 
 def decode_geom_to_geojson(geom_value):
+    """Decode geometry into GeoJSON dict"""
     try:
         if geom_value is None:
             return None
@@ -67,22 +69,22 @@ def decode_geom_to_geojson(geom_value):
             return mapping(wkb.loads(geom_value))
         if isinstance(geom_value, str):
             s = geom_value.strip()
-            # try JSON
             if s.startswith("{") and s.endswith("}"):
                 try:
                     return json.loads(s)
-                except: pass
-            # try WKT
+                except:
+                    pass
             try:
                 return mapping(wkt.loads(s))
-            except: pass
-            # try WKB hex
+            except:
+                pass
             try:
                 return mapping(wkb.loads(bytes.fromhex(s)))
-            except: pass
+            except:
+                pass
         return None
     except Exception as e:
-        logging.error(f"decode_geom_to_geojson failed: {e}")
+        logging.error(f"decode_geom_to_geojson failed: {e}\n{traceback.format_exc()}")
         return None
 
 def query_mpc(tile_geom, start_date, end_date):
@@ -96,16 +98,18 @@ def query_mpc(tile_geom, start_date, end_date):
             "datetime": f"{start_date}/{end_date}",
             "query": {"eo:cloud_cover": {"lt": CLOUD_COVER}}
         }
+        logging.info(f"STAC query: {MPC_COLLECTION}, {start_date}->{end_date}, cloud<{CLOUD_COVER}")
         resp = session.post(MPC_STAC, json=body, timeout=45)
         if not resp.ok:
             logging.error(f"STAC error {resp.status_code}: {resp.text}")
             return []
         return resp.json().get("features", [])
     except Exception as e:
-        logging.error(f"MPC query failed: {e}")
+        logging.error(f"MPC query failed: {e}\n{traceback.format_exc()}")
         return []
 
 def _signed_asset_url(assets, primary_key, fallback_key=None):
+    """Get signed PC asset URL"""
     href = None
     if primary_key in assets and "href" in assets[primary_key]:
         href = assets[primary_key]["href"]
@@ -118,24 +122,22 @@ def _signed_asset_url(assets, primary_key, fallback_key=None):
     except:
         return href
 
-def download_to_b2(url, b2_path):
-    tmp = tempfile.NamedTemporaryFile(delete=False)
+def download_band(url, b2_path):
+    """Download asset to local temp + upload to B2"""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
         r = session.get(url, stream=True, timeout=120)
         if not r.ok:
-            return None
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                tmp.write(chunk)
-        tmp.close()
+            return None, None
+        with open(tmp.name, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024*1024):
+                if chunk:
+                    f.write(chunk)
         bucket.upload_local_file(local_file=tmp.name, file_name=b2_path)
-        return f"b2://{B2_BUCKET_NAME}/{b2_path}"
+        return tmp.name, f"b2://{B2_BUCKET_NAME}/{b2_path}"
     except Exception as e:
-        logging.error(f"Download/upload failed: {e}")
-        return None
-    finally:
-        try: os.remove(tmp.name)
-        except: pass
+        logging.error(f"Download/upload failed: {e}\n{traceback.format_exc()}")
+        return None, None
 
 def _record_exists(tile_id, acq_date):
     try:
@@ -164,17 +166,11 @@ def pick_best_scene(scenes):
     except:
         return None
 
-# ---------- NEW: NDVI Calculation ----------
-def compute_and_upload_ndvi(tile_id, acq_date, red_b2, nir_b2):
-    red_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
-    nir_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+# ---------- NDVI Calculation ----------
+def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
     ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
-        # download from B2
-        bucket.download_file_by_name(red_b2.replace(f"b2://{B2_BUCKET_NAME}/", ""), red_tmp.name)
-        bucket.download_file_by_name(nir_b2.replace(f"b2://{B2_BUCKET_NAME}/", ""), nir_tmp.name)
-
-        with rasterio.open(red_tmp.name) as rsrc, rasterio.open(nir_tmp.name) as nsrc:
+        with rasterio.open(red_local) as rsrc, rasterio.open(nir_local) as nsrc:
             red = rsrc.read(1).astype("float32")
             nir = nsrc.read(1).astype("float32")
             meta = rsrc.meta.copy()
@@ -184,32 +180,27 @@ def compute_and_upload_ndvi(tile_id, acq_date, red_b2, nir_b2):
         ndvi = np.where((nir + red) == 0, np.nan, ndvi)
 
         valid = ~np.isnan(ndvi)
-        if valid.sum() == 0:
-            return None, {}
+        stats = {}
+        if valid.sum() > 0:
+            stats = {
+                "ndvi_min": float(np.nanmin(ndvi)),
+                "ndvi_max": float(np.nanmax(ndvi)),
+                "ndvi_mean": float(np.nanmean(ndvi)),
+                "ndvi_std_dev": float(np.nanstd(ndvi)),
+                "vegetation_coverage_percent": float((ndvi > 0.3).sum() / valid.sum() * 100.0),
+                "data_completeness_percent": float(valid.sum() / ndvi.size * 100.0)
+            }
 
-        stats = {
-            "ndvi_min": float(np.nanmin(ndvi)),
-            "ndvi_max": float(np.nanmax(ndvi)),
-            "ndvi_mean": float(np.nanmean(ndvi)),
-            "ndvi_std_dev": float(np.nanstd(ndvi)),
-            "vegetation_coverage_percent": float((ndvi > 0.3).sum() / valid.sum() * 100.0),
-            "data_completeness_percent": float(valid.sum() / ndvi.size * 100.0)
-        }
-
-        # save NDVI tif
         meta.update(dtype=rasterio.float32, count=1)
         with rasterio.open(ndvi_tmp.name, "w", **meta) as dst:
             dst.write(ndvi.astype(rasterio.float32), 1)
 
         ndvi_b2_path = f"{B2_PREFIX}ndvi/{tile_id}/{acq_date}/ndvi.tif"
         bucket.upload_local_file(local_file=ndvi_tmp.name, file_name=ndvi_b2_path)
-        ndvi_b2 = f"b2://{B2_BUCKET_NAME}/{ndvi_b2_path}"
-
-        return ndvi_b2, stats
+        return f"b2://{B2_BUCKET_NAME}/{ndvi_b2_path}", stats
     finally:
-        for f in [red_tmp.name, nir_tmp.name, ndvi_tmp.name]:
-            try: os.remove(f)
-            except: pass
+        try: os.remove(ndvi_tmp.name)
+        except: pass
 
 # ---------------- Main process ----------------
 def process_tile(tile):
@@ -241,14 +232,14 @@ def process_tile(tile):
         if not red_url or not nir_url:
             return False
 
-        red_b2 = download_to_b2(red_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif")
-        nir_b2 = download_to_b2(nir_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif")
-
-        if not red_b2 or not nir_b2:
+        # download + upload Red/NIR
+        red_local, red_b2 = download_band(red_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif")
+        nir_local, nir_b2 = download_band(nir_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif")
+        if not red_local or not nir_local:
             return False
 
-        # ✅ compute NDVI
-        ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_b2, nir_b2)
+        # compute NDVI
+        ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
         if not ndvi_b2:
             return False
 
@@ -272,7 +263,7 @@ def process_tile(tile):
         logging.info(f"✅ Stored {tile_id} {acq_date} with NDVI stats {stats}")
         return True
     except Exception as e:
-        logging.error(f"process_tile error: {e}")
+        logging.error(f"process_tile error: {e}\n{traceback.format_exc()}")
         return False
 
 def main(cloud_cover=20, lookback_days=5):
