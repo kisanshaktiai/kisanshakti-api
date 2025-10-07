@@ -149,24 +149,46 @@ def compress_and_upload(local_path, b2_key):
         except: pass
 
 def download_band(url, b2_path):
-    """Download band → compress → upload"""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+    """Download band → compress → upload → return compressed local + b2_uri"""
+    raw_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+    compressed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
+        # Download raw file
         r = session.get(url, stream=True, timeout=120)
         if not r.ok:
             return None, None
-        with open(tmp.name, "wb") as f:
+        with open(raw_tmp.name, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024*1024):
                 if chunk:
                     f.write(chunk)
-        b2_uri = compress_and_upload(tmp.name, b2_path)
-        return tmp.name, b2_uri
+
+        # Compress raw → compressed_tmp
+        with rasterio.open(raw_tmp.name) as src:
+            data = src.read()
+            meta = src.meta.copy()
+            meta.update(
+                compress="LZW",
+                tiled=True,
+                blockxsize=512,
+                blockysize=512
+            )
+            with rasterio.open(compressed_tmp.name, "w", **meta) as dst:
+                dst.write(data)
+
+        # Upload compressed version
+        logging.info(f"Uploading compressed COG to B2: {B2_BUCKET_NAME}/{b2_path}")
+        bucket.upload_local_file(local_file=compressed_tmp.name, file_name=b2_path)
+
+        # Return path to compressed local file (safe for rasterio open)
+        return compressed_tmp.name, f"b2://{B2_BUCKET_NAME}/{b2_path}"
+
     except Exception as e:
         logging.error(f"Download/compress/upload failed: {e}\n{traceback.format_exc()}")
         return None, None
     finally:
-        try: os.remove(tmp.name)
+        try: os.remove(raw_tmp.name)
         except: pass
+        # ⚠️ do NOT delete compressed_tmp.name, because compute_and_upload_ndvi still needs it
 
 def _record_exists(tile_id, acq_date):
     try:
@@ -312,3 +334,4 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
