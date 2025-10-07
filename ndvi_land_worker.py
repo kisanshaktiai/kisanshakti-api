@@ -8,11 +8,13 @@ from mercantile import tiles
 
 # ---------------- Config ----------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
 
-B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")
-B2_APP_KEY = os.environ.get("B2_KEY")
-B2_BUCKET_NAME = "kisanshakti-ndvi-tiles"  # fixed bucket name
+# Backblaze B2 (farmer app only needs READ)
+B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")        # matches env
+B2_APP_KEY = os.environ.get("B2_APP_KEY")          # ✅ fixed name
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET")       # matches env
+B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/processed/")
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
