@@ -122,8 +122,34 @@ def _signed_asset_url(assets, primary_key, fallback_key=None):
     except:
         return href
 
+def compress_and_upload(local_path, b2_key):
+    """Compress a raster to LZW COG and upload to B2"""
+    compressed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+    try:
+        with rasterio.open(local_path) as src:
+            data = src.read()
+            meta = src.meta.copy()
+            meta.update(
+                compress="LZW",        # lossless compression
+                tiled=True,            # cloud-optimized layout
+                blockxsize=512,
+                blockysize=512
+            )
+            with rasterio.open(compressed_tmp.name, "w", **meta) as dst:
+                dst.write(data)
+
+        logging.info(f"Uploading compressed COG to B2: {B2_BUCKET_NAME}/{b2_key}")
+        bucket.upload_local_file(local_file=compressed_tmp.name, file_name=b2_key)
+        return f"b2://{B2_BUCKET_NAME}/{b2_key}"
+    except Exception as e:
+        logging.error(f"Compression/upload failed: {e}\n{traceback.format_exc()}")
+        return None
+    finally:
+        try: os.remove(compressed_tmp.name)
+        except: pass
+
 def download_band(url, b2_path):
-    """Download asset to local temp + upload to B2"""
+    """Download band → compress → upload"""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
         r = session.get(url, stream=True, timeout=120)
@@ -133,11 +159,14 @@ def download_band(url, b2_path):
             for chunk in r.iter_content(chunk_size=1024*1024):
                 if chunk:
                     f.write(chunk)
-        bucket.upload_local_file(local_file=tmp.name, file_name=b2_path)
-        return tmp.name, f"b2://{B2_BUCKET_NAME}/{b2_path}"
+        b2_uri = compress_and_upload(tmp.name, b2_path)
+        return tmp.name, b2_uri
     except Exception as e:
-        logging.error(f"Download/upload failed: {e}\n{traceback.format_exc()}")
+        logging.error(f"Download/compress/upload failed: {e}\n{traceback.format_exc()}")
         return None, None
+    finally:
+        try: os.remove(tmp.name)
+        except: pass
 
 def _record_exists(tile_id, acq_date):
     try:
@@ -166,33 +195,6 @@ def pick_best_scene(scenes):
     except:
         return None
 
-def compress_and_upload(local_path, b2_key):
-    """Compress a raster to LZW COG and upload to B2"""
-    compressed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
-    try:
-        with rasterio.open(local_path) as src:
-            data = src.read()
-            meta = src.meta.copy()
-            meta.update(
-                compress="LZW",        # lossless compression
-                tiled=True,            # enables cloud-optimized layout
-                blockxsize=512,        # typical COG tiling
-                blockysize=512
-            )
-            with rasterio.open(compressed_tmp.name, "w", **meta) as dst:
-                dst.write(data)
-
-        # Upload compressed file
-        logging.info(f"Uploading compressed COG to B2: {B2_BUCKET_NAME}/{b2_key}")
-        bucket.upload_local_file(local_file=compressed_tmp.name, file_name=b2_key)
-        return f"b2://{B2_BUCKET_NAME}/{b2_key}"
-    except Exception as e:
-        logging.error(f"Compression/upload failed: {e}\n{traceback.format_exc()}")
-        return None
-    finally:
-        try: os.remove(compressed_tmp.name)
-        except: pass
-
 # ---------- NDVI Calculation ----------
 def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
     ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
@@ -218,7 +220,7 @@ def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
                 "data_completeness_percent": float(valid.sum() / ndvi.size * 100.0)
             }
 
-        meta.update(dtype=rasterio.float32, count=1)
+        meta.update(dtype=rasterio.float32, count=1, compress="LZW", tiled=True)
         with rasterio.open(ndvi_tmp.name, "w", **meta) as dst:
             dst.write(ndvi.astype(rasterio.float32), 1)
 
@@ -259,13 +261,13 @@ def process_tile(tile):
         if not red_url or not nir_url:
             return False
 
-        # download + upload Red/NIR
+        # download + compress + upload Red/NIR
         red_local, red_b2 = download_band(red_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif")
         nir_local, nir_b2 = download_band(nir_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif")
         if not red_local or not nir_local:
             return False
 
-        # compute NDVI
+        # compute NDVI (compressed)
         ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
         if not ndvi_b2:
             return False
@@ -310,4 +312,3 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
-
