@@ -195,16 +195,23 @@ def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
     """Compute NDVI and upload to B2, return B2 URI and stats"""
     ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
+        logging.info(f"📂 Opening Red band: {red_local}")
+        logging.info(f"📂 Opening NIR band: {nir_local}")
+        
         with rasterio.open(red_local) as rsrc, rasterio.open(nir_local) as nsrc:
             red = rsrc.read(1).astype("float32")
             nir = nsrc.read(1).astype("float32")
             meta = rsrc.meta.copy()
+        
+        logging.info(f"✅ Bands loaded. Shape: {red.shape}")
 
         np.seterr(divide="ignore", invalid="ignore")
         ndvi = (nir - red) / (nir + red)
         ndvi = np.where((nir + red) == 0, np.nan, ndvi)
 
         valid = ~np.isnan(ndvi)
+        logging.info(f"📊 Valid pixels: {valid.sum()}/{ndvi.size} ({valid.sum()/ndvi.size*100:.1f}%)")
+        
         stats = {
             "ndvi_min": None,
             "ndvi_max": None,
@@ -223,20 +230,28 @@ def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
                 "vegetation_coverage_percent": float((ndvi > 0.3).sum() / valid.sum() * 100.0),
                 "data_completeness_percent": float(valid.sum() / ndvi.size * 100.0)
             }
+            logging.info(f"📈 NDVI stats: min={stats['ndvi_min']:.3f}, max={stats['ndvi_max']:.3f}, mean={stats['ndvi_mean']:.3f}")
 
+        logging.info(f"💾 Writing NDVI to temp file: {ndvi_tmp.name}")
         meta.update(dtype=rasterio.float32, count=1, compress="LZW", tiled=True)
         with rasterio.open(ndvi_tmp.name, "w", **meta) as dst:
             dst.write(ndvi.astype(rasterio.float32), 1)
 
         ndvi_b2_path = f"{B2_PREFIX}ndvi/{tile_id}/{acq_date}/ndvi.tif"
+        logging.info(f"☁️  Uploading NDVI to B2: {B2_BUCKET_NAME}/{ndvi_b2_path}")
         bucket.upload_local_file(local_file=ndvi_tmp.name, file_name=ndvi_b2_path)
+        logging.info(f"✅ NDVI uploaded successfully")
+        
         return f"b2://{B2_BUCKET_NAME}/{ndvi_b2_path}", stats
     except Exception as e:
-        logging.error(f"NDVI computation failed: {e}\n{traceback.format_exc()}")
+        logging.error(f"❌ NDVI computation failed: {e}\n{traceback.format_exc()}")
         return None, None
     finally:
-        try: os.remove(ndvi_tmp.name)
-        except: pass
+        try: 
+            os.remove(ndvi_tmp.name)
+            logging.debug(f"🧹 Removed temp NDVI file: {ndvi_tmp.name}")
+        except Exception as e:
+            logging.warning(f"⚠️ Could not remove temp NDVI file: {e}")
 
 # ---------------- Main process ----------------
 def process_tile(tile):
@@ -290,18 +305,27 @@ def process_tile(tile):
 
         # Compute NDVI
         logging.info(f"🧮 Computing NDVI for {tile_id} {acq_date}")
-        ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
+        try:
+            ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
+            logging.info(f"📊 NDVI computation complete. B2 path: {ndvi_b2}, Stats: {stats}")
+        except Exception as ndvi_err:
+            logging.error(f"❌ NDVI computation exception for {tile_id}: {ndvi_err}")
+            logging.error(traceback.format_exc())
+            return False
         
         # Cleanup temp Red/NIR after NDVI is done
         try:
             os.remove(red_local)
             os.remove(nir_local)
-        except Exception:
-            pass
+            logging.info(f"🧹 Cleaned up temp files for {tile_id}")
+        except Exception as cleanup_err:
+            logging.warning(f"⚠️ Cleanup warning: {cleanup_err}")
 
         if not ndvi_b2 or stats is None:
-            logging.error(f"❌ Failed NDVI computation for {tile_id}")
+            logging.error(f"❌ Failed NDVI computation for {tile_id} - ndvi_b2: {ndvi_b2}, stats: {stats}")
             return False
+        
+        logging.info(f"✅ NDVI ready for {tile_id} {acq_date}")
 
         # Prepare payload with all required fields including country_id
         payload = {
