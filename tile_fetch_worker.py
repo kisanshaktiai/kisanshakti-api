@@ -166,6 +166,33 @@ def pick_best_scene(scenes):
     except:
         return None
 
+def compress_and_upload(local_path, b2_key):
+    """Compress a raster to LZW COG and upload to B2"""
+    compressed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+    try:
+        with rasterio.open(local_path) as src:
+            data = src.read()
+            meta = src.meta.copy()
+            meta.update(
+                compress="LZW",        # lossless compression
+                tiled=True,            # enables cloud-optimized layout
+                blockxsize=512,        # typical COG tiling
+                blockysize=512
+            )
+            with rasterio.open(compressed_tmp.name, "w", **meta) as dst:
+                dst.write(data)
+
+        # Upload compressed file
+        logging.info(f"Uploading compressed COG to B2: {B2_BUCKET_NAME}/{b2_key}")
+        bucket.upload_local_file(local_file=compressed_tmp.name, file_name=b2_key)
+        return f"b2://{B2_BUCKET_NAME}/{b2_key}"
+    except Exception as e:
+        logging.error(f"Compression/upload failed: {e}\n{traceback.format_exc()}")
+        return None
+    finally:
+        try: os.remove(compressed_tmp.name)
+        except: pass
+
 # ---------- NDVI Calculation ----------
 def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
     ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
@@ -283,3 +310,4 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
