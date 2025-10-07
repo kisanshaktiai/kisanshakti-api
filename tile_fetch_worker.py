@@ -265,15 +265,18 @@ def process_tile(tile):
 
         scenes = query_mpc(geom_value, start_date, end_date)
         if not scenes:
+            logging.info(f"🔍 No scenes for {tile_id} in {start_date}..{end_date}")
             return False
 
         scene = pick_best_scene(scenes)
         if not scene:
+            logging.info(f"⚠️ No valid scene after sorting for {tile_id}")
             return False
 
         acq_date = scene["properties"]["datetime"].split("T")[0]
         exists, row = _record_exists(tile_id, acq_date)
         if exists and row and row.get("status") in ("downloaded", "ready"):
+            logging.info(f"⏩ Skipping {tile_id} {acq_date}, already in DB with status={row.get('status')}")
             return False
 
         assets = scene.get("assets", {})
@@ -281,18 +284,28 @@ def process_tile(tile):
         nir_url = _signed_asset_url(assets, "nir", "B08")
 
         if not red_url or not nir_url:
+            logging.warning(f"❌ Missing red/nir URLs for {tile_id} {acq_date}")
             return False
 
         # download + compress + upload Red/NIR
         red_local, red_b2 = download_band(red_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif")
         nir_local, nir_b2 = download_band(nir_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif")
         if not red_local or not nir_local:
+            logging.error(f"❌ Failed to download/compress Red or NIR for {tile_id}")
             return False
 
         # compute NDVI (compressed)
         ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
         if not ndvi_b2:
+            logging.error(f"❌ Failed NDVI computation for {tile_id}")
             return False
+
+        # cleanup temp Red/NIR after NDVI is done
+        try:
+            os.remove(red_local)
+            os.remove(nir_local)
+        except Exception:
+            pass
 
         payload = {
             "tile_id": tile_id,
@@ -307,14 +320,15 @@ def process_tile(tile):
             **stats
         }
 
-        supabase.table("satellite_tiles") \
-            .upsert(payload, on_conflict="tile_id,acquisition_date,collection") \
+        resp = supabase.table("satellite_tiles") \
+            .upsert(payload, on_conflict=["tile_id", "acquisition_date", "collection"]) \
             .execute()
 
-        logging.info(f"✅ Stored {tile_id} {acq_date} with NDVI stats {stats}")
+        logging.info(f"✅ Upserted {tile_id} {acq_date}, NDVI stats={stats}, Supabase resp={resp}")
         return True
+
     except Exception as e:
-        logging.error(f"process_tile error: {e}\n{traceback.format_exc()}")
+        logging.error(f"process_tile error for {tile.get('tile_id')}: {e}\n{traceback.format_exc()}")
         return False
 
 def main(cloud_cover=20, lookback_days=5):
@@ -334,4 +348,5 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
 
