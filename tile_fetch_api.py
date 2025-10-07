@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI
 import logging
 import tile_fetch_worker
 
@@ -9,11 +9,14 @@ def health_check():
     return {"status": "ok"}
 
 @app.post("/run")
-def run_worker(background_tasks: BackgroundTasks):
+def run_worker():
     try:
-        background_tasks.add_task(tile_fetch_worker.main)
-        logging.info("Tile Fetch worker started in background")
-        return {"status": "started"}
+        tile_fetch_worker.main()
+        return {"status": "success"}
     except Exception as e:
-        logging.error(f"Tile Fetch worker failed to start: {e}")
-        return {"status": "error", "message": str(e)}
+        logging.exception("Tile fetch worker failed")  # 🔥 logs full traceback
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": type(e).__name__
+        }
