@@ -5,6 +5,8 @@ from requests.adapters import HTTPAdapter, Retry
 from shapely import wkb, wkt
 from shapely.geometry import mapping  # shapely -> GeoJSON dict
 import planetary_computer as pc
+import rasterio
+import numpy as np
 
 # ---------------- Config ----------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -43,9 +45,7 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ---------------- Helpers ----------------
 def fetch_agri_tiles():
-    """Get MGRS tiles where is_agri=True"""
     try:
-        # Keep it simple; we will decode various formats in Python
         resp = supabase.table("mgrs_tiles") \
             .select("tile_id, geometry") \
             .eq("is_agri", True) \
@@ -58,88 +58,54 @@ def fetch_agri_tiles():
         return []
 
 def decode_geom_to_geojson(geom_value):
-    """Handle geometry from Supabase: GeoJSON dict, WKB hex (str), bytes (WKB), or WKT string"""
     try:
         if geom_value is None:
-            logging.warning("Geometry is None")
             return None
-
-        # Case 1: already GeoJSON dict
         if isinstance(geom_value, dict) and "type" in geom_value and "coordinates" in geom_value:
             return geom_value
-
-        # Case 2: bytes -> WKB
         if isinstance(geom_value, (bytes, bytearray)):
-            geom = wkb.loads(geom_value)
-            gj = mapping(geom)
-            return gj
-
-        # Case 3: string -> could be WKB hex OR WKT OR JSON string
+            return mapping(wkb.loads(geom_value))
         if isinstance(geom_value, str):
             s = geom_value.strip()
-            preview = s[:60].replace("\n", "")
-            logging.debug(f"Geometry string preview: {preview}...")
-
-            # Try JSON-GeoJSON string
+            # try JSON
             if s.startswith("{") and s.endswith("}"):
                 try:
-                    d = json.loads(s)
-                    if isinstance(d, dict) and "type" in d and "coordinates" in d:
-                        return d
-                except Exception:
-                    pass
-
-            # Try WKT
+                    return json.loads(s)
+                except: pass
+            # try WKT
             try:
-                geom = wkt.loads(s)  # e.g., "POLYGON((...))"
-                return mapping(geom)
-            except Exception:
-                pass
-
-            # Try WKB hex
+                return mapping(wkt.loads(s))
+            except: pass
+            # try WKB hex
             try:
-                geom = wkb.loads(bytes.fromhex(s))
-                return mapping(geom)
-            except Exception:
-                pass
-
-            logging.error("Failed to parse geometry string as JSON/WKT/WKB.")
-            return None
-
-        logging.error(f"Unexpected geometry type: {type(geom_value)}")
+                return mapping(wkb.loads(bytes.fromhex(s)))
+            except: pass
         return None
     except Exception as e:
-        logging.error(f"Failed to decode geometry: {e}\n{traceback.format_exc()}")
+        logging.error(f"decode_geom_to_geojson failed: {e}")
         return None
 
 def query_mpc(tile_geom, start_date, end_date):
     try:
         geom_json = decode_geom_to_geojson(tile_geom)
         if not geom_json:
-            logging.warning("Skipping MPC query: geometry decode failed.")
             return []
-
         body = {
             "collections": [MPC_COLLECTION],
             "intersects": geom_json,
             "datetime": f"{start_date}/{end_date}",
             "query": {"eo:cloud_cover": {"lt": CLOUD_COVER}}
         }
-        logging.info(f"STAC query: {MPC_COLLECTION}, {start_date}->{end_date}, cloud<{CLOUD_COVER}")
         resp = session.post(MPC_STAC, json=body, timeout=45)
         if not resp.ok:
-            logging.error(f"STAC HTTP {resp.status_code}: {resp.text}")
+            logging.error(f"STAC error {resp.status_code}: {resp.text}")
             return []
-        out = resp.json()
-        feats = out.get("features", [])
-        logging.info(f"STAC returned {len(feats)} features")
-        return feats
+        return resp.json().get("features", [])
     except Exception as e:
-        logging.error(f"MPC query failed: {e}\n{traceback.format_exc()}")
+        logging.error(f"MPC query failed: {e}")
         return []
 
 def _signed_asset_url(assets, primary_key, fallback_key=None):
-    """Get a signed Planetary Computer asset URL for a given key."""
     href = None
     if primary_key in assets and "href" in assets[primary_key]:
         href = assets[primary_key]["href"]
@@ -148,52 +114,40 @@ def _signed_asset_url(assets, primary_key, fallback_key=None):
     if not href:
         return None
     try:
-        # Planetary Computer assets often require signing
         return pc.sign(href)
-    except Exception as e:
-        logging.warning(f"Failed to sign asset URL, using raw href. {e}")
+    except:
         return href
 
 def download_to_b2(url, b2_path):
     tmp = tempfile.NamedTemporaryFile(delete=False)
     try:
-        logging.info(f"Downloading: {url}")
         r = session.get(url, stream=True, timeout=120)
         if not r.ok:
-            logging.error(f"Download HTTP {r.status_code}: {r.text[:300]}")
-            r.raise_for_status()
-        size = 0
+            return None
         for chunk in r.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 tmp.write(chunk)
-                size += len(chunk)
         tmp.close()
-        logging.info(f"Uploading to B2: {B2_BUCKET_NAME}/{b2_path} (bytes={size})")
         bucket.upload_local_file(local_file=tmp.name, file_name=b2_path)
         return f"b2://{B2_BUCKET_NAME}/{b2_path}"
     except Exception as e:
-        logging.error(f"Download/upload failed for {url}: {e}\n{traceback.format_exc()}")
+        logging.error(f"Download/upload failed: {e}")
         return None
     finally:
-        try:
-            os.remove(tmp.name)
-        except Exception:
-            pass
+        try: os.remove(tmp.name)
+        except: pass
 
 def _record_exists(tile_id, acq_date):
     try:
         resp = supabase.table("satellite_tiles") \
-            .select("id,status,red_band_path,nir_band_path") \
+            .select("id,status") \
             .eq("tile_id", tile_id) \
             .eq("acquisition_date", acq_date) \
             .eq("collection", MPC_COLLECTION.upper()) \
             .limit(1).execute()
         rows = resp.data or []
-        if not rows:
-            return False, None
-        return True, rows[0]
-    except Exception as e:
-        logging.warning(f"existence check failed: {e}")
+        return (True, rows[0]) if rows else (False, None)
+    except:
         return False, None
 
 def pick_best_scene(scenes):
@@ -201,16 +155,63 @@ def pick_best_scene(scenes):
         return sorted(
             scenes,
             key=lambda s: (
-                s.get("properties", {}).get("eo:cloud_cover", 100.0),
+                s["properties"].get("eo:cloud_cover", 100),
                 -datetime.datetime.fromisoformat(
                     s["properties"]["datetime"].replace("Z", "+00:00")
                 ).timestamp()
             )
         )[0] if scenes else None
-    except Exception as e:
-        logging.error(f"Scene sorting failed: {e}")
+    except:
         return None
 
+# ---------- NEW: NDVI Calculation ----------
+def compute_and_upload_ndvi(tile_id, acq_date, red_b2, nir_b2):
+    red_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+    nir_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+    ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+    try:
+        # download from B2
+        bucket.download_file_by_name(red_b2.replace(f"b2://{B2_BUCKET_NAME}/", ""), red_tmp.name)
+        bucket.download_file_by_name(nir_b2.replace(f"b2://{B2_BUCKET_NAME}/", ""), nir_tmp.name)
+
+        with rasterio.open(red_tmp.name) as rsrc, rasterio.open(nir_tmp.name) as nsrc:
+            red = rsrc.read(1).astype("float32")
+            nir = nsrc.read(1).astype("float32")
+            meta = rsrc.meta.copy()
+
+        np.seterr(divide="ignore", invalid="ignore")
+        ndvi = (nir - red) / (nir + red)
+        ndvi = np.where((nir + red) == 0, np.nan, ndvi)
+
+        valid = ~np.isnan(ndvi)
+        if valid.sum() == 0:
+            return None, {}
+
+        stats = {
+            "ndvi_min": float(np.nanmin(ndvi)),
+            "ndvi_max": float(np.nanmax(ndvi)),
+            "ndvi_mean": float(np.nanmean(ndvi)),
+            "ndvi_std_dev": float(np.nanstd(ndvi)),
+            "vegetation_coverage_percent": float((ndvi > 0.3).sum() / valid.sum() * 100.0),
+            "data_completeness_percent": float(valid.sum() / ndvi.size * 100.0)
+        }
+
+        # save NDVI tif
+        meta.update(dtype=rasterio.float32, count=1)
+        with rasterio.open(ndvi_tmp.name, "w", **meta) as dst:
+            dst.write(ndvi.astype(rasterio.float32), 1)
+
+        ndvi_b2_path = f"{B2_PREFIX}ndvi/{tile_id}/{acq_date}/ndvi.tif"
+        bucket.upload_local_file(local_file=ndvi_tmp.name, file_name=ndvi_b2_path)
+        ndvi_b2 = f"b2://{B2_BUCKET_NAME}/{ndvi_b2_path}"
+
+        return ndvi_b2, stats
+    finally:
+        for f in [red_tmp.name, nir_tmp.name, ndvi_tmp.name]:
+            try: os.remove(f)
+            except: pass
+
+# ---------------- Main process ----------------
 def process_tile(tile):
     try:
         tile_id = tile["tile_id"]
@@ -222,34 +223,33 @@ def process_tile(tile):
 
         scenes = query_mpc(geom_value, start_date, end_date)
         if not scenes:
-            logging.info(f"🔍 No scenes for {tile_id} in window {start_date}..{end_date}")
             return False
 
         scene = pick_best_scene(scenes)
         if not scene:
-            logging.info(f"⚠️ No valid scene after sorting for {tile_id}")
             return False
 
         acq_date = scene["properties"]["datetime"].split("T")[0]
         exists, row = _record_exists(tile_id, acq_date)
         if exists and row and row.get("status") in ("downloaded", "ready"):
-            logging.info(f"⏩ Skipping existing {tile_id} {acq_date} (status={row.get('status')})")
             return False
 
         assets = scene.get("assets", {})
-        # Try red/nir first, fallback to band IDs
         red_url = _signed_asset_url(assets, "red", "B04")
         nir_url = _signed_asset_url(assets, "nir", "B08")
 
         if not red_url or not nir_url:
-            logging.warning(f"❌ Missing red/nir URLs for {tile_id} {acq_date}")
             return False
 
         red_b2 = download_to_b2(red_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif")
         nir_b2 = download_to_b2(nir_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif")
 
         if not red_b2 or not nir_b2:
-            logging.error(f"❌ Upload to B2 failed for {tile_id} {acq_date}")
+            return False
+
+        # ✅ compute NDVI
+        ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_b2, nir_b2)
+        if not ndvi_b2:
             return False
 
         payload = {
@@ -258,19 +258,21 @@ def process_tile(tile):
             "collection": MPC_COLLECTION.upper(),
             "red_band_path": red_b2,
             "nir_band_path": nir_b2,
-            "status": "downloaded",
+            "ndvi_path": ndvi_b2,
+            "status": "ready",
             "api_source": "planetary_computer",
-            "updated_at": datetime.datetime.utcnow().isoformat() + "Z"
+            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+            **stats
         }
 
         supabase.table("satellite_tiles") \
             .upsert(payload, on_conflict="tile_id,acquisition_date,collection") \
             .execute()
 
-        logging.info(f"✅ Stored {tile_id} {acq_date} -> red={red_b2} nir={nir_b2}")
+        logging.info(f"✅ Stored {tile_id} {acq_date} with NDVI stats {stats}")
         return True
     except Exception as e:
-        logging.error(f"process_tile error for {tile.get('tile_id')}: {e}\n{traceback.format_exc()}")
+        logging.error(f"process_tile error: {e}")
         return False
 
 def main(cloud_cover=20, lookback_days=5):
@@ -281,14 +283,12 @@ def main(cloud_cover=20, lookback_days=5):
     processed = 0
     tiles = fetch_agri_tiles()
     for t in tiles:
-        ok = process_tile(t)
-        if ok:
+        if process_tile(t):
             processed += 1
     logging.info(f"Finished: processed {processed}/{len(tiles)} tiles")
     return processed
 
 if __name__ == "__main__":
-    # Example: drive it with env or defaults
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
