@@ -1,3 +1,4 @@
+# Updated Version - 6 
 import os, requests, json, datetime, tempfile, logging, traceback
 from supabase import create_client
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
@@ -134,6 +135,19 @@ def check_b2_file_exists(b2_path):
     except Exception:
         return False
 
+def download_from_b2(b2_path):
+    """Download file from B2 to local temp file"""
+    try:
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+        logging.info(f"📥 Downloading from B2: {b2_path}")
+        bucket.download_file_by_name(b2_path, temp_file)
+        temp_file.close()
+        logging.info(f"✅ Downloaded from B2 to: {temp_file.name}")
+        return temp_file.name
+    except Exception as e:
+        logging.error(f"❌ Failed to download from B2: {e}")
+        return None
+
 def get_b2_paths(tile_id, acq_date):
     """Generate B2 paths for red, nir, and ndvi"""
     return {
@@ -257,8 +271,6 @@ def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
     """Compute NDVI with minimal memory footprint and upload to B2"""
     ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
-        logging.info(f"🧮 Computing NDVI for {tile_id} {acq_date}")
-        
         with rasterio.open(red_local) as rsrc, rasterio.open(nir_local) as nsrc:
             meta = rsrc.meta.copy()
             height = rsrc.height
@@ -417,11 +429,14 @@ def process_tile(tile):
         nir_local = None
         red_b2 = f"b2://{B2_BUCKET_NAME}/{paths['red']}"
         nir_b2 = f"b2://{B2_BUCKET_NAME}/{paths['nir']}"
+        need_cleanup_red = False
+        need_cleanup_nir = False
         
         # Download Red if not exists
         if not exists["red"]:
             logging.info(f"📥 Downloading Red band for {tile_id} {acq_date}")
             red_local, red_b2 = download_band(red_url, paths["red"])
+            need_cleanup_red = True
             if not red_local:
                 logging.error(f"❌ Failed to download Red for {tile_id}")
                 return False
@@ -432,42 +447,60 @@ def process_tile(tile):
         if not exists["nir"]:
             logging.info(f"📥 Downloading NIR band for {tile_id} {acq_date}")
             nir_local, nir_b2 = download_band(nir_url, paths["nir"])
+            need_cleanup_nir = True
             if not nir_local:
                 logging.error(f"❌ Failed to download NIR for {tile_id}")
-                if red_local:
+                if need_cleanup_red and red_local:
                     try: os.remove(red_local)
                     except: pass
                 return False
         else:
             logging.info(f"✅ NIR band already exists, skipping download")
         
-        # Compute NDVI if not exists or if we downloaded new bands
+        # Compute NDVI if not exists
         ndvi_b2 = f"b2://{B2_BUCKET_NAME}/{paths['ndvi']}"
         stats = None
         
-        if not exists["ndvi"] or red_local or nir_local:
-            # Need to download bands temporarily if they exist in B2 but not locally
-            temp_files_to_cleanup = []
+        if not exists["ndvi"]:
+            # Need bands for NDVI computation
             
+            # If files weren't just downloaded, get them from B2
             if not red_local:
-                logging.info(f"📥 Temporarily downloading Red for NDVI computation")
-                red_local, _ = download_band(red_url, paths["red"])
-                temp_files_to_cleanup.append(red_local)
+                if exists["red"]:
+                    logging.info(f"📥 Downloading Red from B2 for NDVI computation")
+                    red_local = download_from_b2(paths["red"])
+                    need_cleanup_red = True
+                else:
+                    logging.error(f"❌ Red band not available")
+                    return False
             
             if not nir_local:
-                logging.info(f"📥 Temporarily downloading NIR for NDVI computation")
-                nir_local, _ = download_band(nir_url, paths["nir"])
-                temp_files_to_cleanup.append(nir_local)
+                if exists["nir"]:
+                    logging.info(f"📥 Downloading NIR from B2 for NDVI computation")
+                    nir_local = download_from_b2(paths["nir"])
+                    need_cleanup_nir = True
+                else:
+                    logging.error(f"❌ NIR band not available")
+                    if need_cleanup_red and red_local:
+                        try: os.remove(red_local)
+                        except: pass
+                    return False
             
             if red_local and nir_local:
                 logging.info(f"🧮 Computing NDVI for {tile_id} {acq_date}")
                 ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
                 
-                # Cleanup
-                for f in [red_local, nir_local]:
+                # Cleanup temporary files
+                if need_cleanup_red and red_local:
                     try: 
-                        if f:
-                            os.remove(f)
+                        os.remove(red_local)
+                        logging.debug(f"🧹 Cleaned up temp Red file")
+                    except: 
+                        pass
+                if need_cleanup_nir and nir_local:
+                    try: 
+                        os.remove(nir_local)
+                        logging.debug(f"🧹 Cleaned up temp NIR file")
                     except: 
                         pass
             else:
