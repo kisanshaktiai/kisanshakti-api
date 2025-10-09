@@ -14,7 +14,7 @@ from PIL import Image
 
 # === CONFIG ===
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
 B2_BUCKET_URL = os.getenv("B2_BUCKET_URL")  # e.g. https://f123.backblazeb2.com/file/ndvi-tiles
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
