@@ -6,6 +6,7 @@ from shapely import wkb, wkt
 from shapely.geometry import mapping
 import planetary_computer as pc
 import rasterio
+from rasterio.windows import Window
 import numpy as np
 
 # ---------------- Config ----------------
@@ -21,6 +22,9 @@ MPC_STAC = os.environ.get("MPC_STAC_BASE", "https://planetarycomputer.microsoft.
 MPC_COLLECTION = os.environ.get("MPC_COLLECTION", "sentinel-2-l2a")
 CLOUD_COVER = int(os.environ.get("DEFAULT_CLOUD_COVER_MAX", "20"))
 LOOKBACK_DAYS = int(os.environ.get("MAX_SCENE_LOOKBACK_DAYS", "5"))
+
+# Memory optimization: downsample factor (1=no downsample, 2=half size, 4=quarter size)
+DOWNSAMPLE_FACTOR = int(os.environ.get("DOWNSAMPLE_FACTOR", "4"))
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -122,45 +126,103 @@ def _signed_asset_url(assets, primary_key, fallback_key=None):
     except:
         return href
 
+def check_b2_file_exists(b2_path):
+    """Check if file exists in B2 bucket"""
+    try:
+        bucket.get_file_info_by_name(b2_path)
+        return True
+    except Exception:
+        return False
+
+def get_b2_paths(tile_id, acq_date):
+    """Generate B2 paths for red, nir, and ndvi"""
+    return {
+        "red": f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif",
+        "nir": f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif",
+        "ndvi": f"{B2_PREFIX}ndvi/{tile_id}/{acq_date}/ndvi.tif"
+    }
+
+def check_existing_files(tile_id, acq_date):
+    """Check which files already exist in B2"""
+    paths = get_b2_paths(tile_id, acq_date)
+    exists = {
+        "red": check_b2_file_exists(paths["red"]),
+        "nir": check_b2_file_exists(paths["nir"]),
+        "ndvi": check_b2_file_exists(paths["ndvi"])
+    }
+    logging.info(f"📂 Existing files in B2: Red={exists['red']}, NIR={exists['nir']}, NDVI={exists['ndvi']}")
+    return exists, paths
+
 def download_band(url, b2_path):
     """Download band → compress → upload → return compressed local + b2_uri"""
     raw_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     compressed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
-        # Download raw file
+        # Download raw file with streaming to minimize memory
+        logging.info(f"📥 Downloading from {url[:80]}...")
         r = session.get(url, stream=True, timeout=120)
         if not r.ok:
+            logging.error(f"❌ Download failed: {r.status_code}")
             return None, None
+        
         with open(raw_tmp.name, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024*1024):
+            for chunk in r.iter_content(chunk_size=512*1024):  # 512KB chunks
                 if chunk:
                     f.write(chunk)
+        
+        logging.info(f"💾 Downloaded to temp: {raw_tmp.name}")
 
-        # Compress raw → compressed_tmp
+        # Compress with windowed processing for memory efficiency
         with rasterio.open(raw_tmp.name) as src:
-            data = src.read()
             meta = src.meta.copy()
+            
+            # Apply downsampling if needed
+            if DOWNSAMPLE_FACTOR > 1:
+                out_shape = (src.height // DOWNSAMPLE_FACTOR, src.width // DOWNSAMPLE_FACTOR)
+                data = src.read(
+                    1,
+                    out_shape=out_shape,
+                    resampling=rasterio.enums.Resampling.average
+                )
+                meta.update({
+                    'height': out_shape[0],
+                    'width': out_shape[1],
+                    'transform': src.transform * src.transform.scale(
+                        (src.width / out_shape[1]),
+                        (src.height / out_shape[0])
+                    )
+                })
+            else:
+                data = src.read(1)
+            
             meta.update(
                 compress="LZW",
                 tiled=True,
-                blockxsize=512,
-                blockysize=512
+                blockxsize=256,
+                blockysize=256
             )
+            
             with rasterio.open(compressed_tmp.name, "w", **meta) as dst:
-                dst.write(data)
+                dst.write(data, 1)
+            
+            # Clear data from memory
+            del data
 
         # Upload compressed version
-        logging.info(f"Uploading compressed COG to B2: {B2_BUCKET_NAME}/{b2_path}")
+        logging.info(f"☁️  Uploading to B2: {b2_path}")
         bucket.upload_local_file(local_file=compressed_tmp.name, file_name=b2_path)
+        logging.info(f"✅ Upload complete")
 
         return compressed_tmp.name, f"b2://{B2_BUCKET_NAME}/{b2_path}"
 
     except Exception as e:
-        logging.error(f"Download/compress/upload failed: {e}\n{traceback.format_exc()}")
+        logging.error(f"❌ Download/compress/upload failed: {e}\n{traceback.format_exc()}")
         return None, None
     finally:
-        try: os.remove(raw_tmp.name)
-        except: pass
+        try: 
+            os.remove(raw_tmp.name)
+        except: 
+            pass
 
 def _record_exists(tile_id, acq_date):
     try:
@@ -192,104 +254,112 @@ def pick_best_scene(scenes):
 
 # ---------- NDVI Calculation ----------
 def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
-    """Compute NDVI and upload to B2, return B2 URI and stats"""
+    """Compute NDVI with minimal memory footprint and upload to B2"""
     ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
-        logging.info(f"📂 Opening Red band: {red_local}")
-        logging.info(f"📂 Opening NIR band: {nir_local}")
+        logging.info(f"🧮 Computing NDVI for {tile_id} {acq_date}")
         
-        # Open with windowed reading to reduce memory usage
         with rasterio.open(red_local) as rsrc, rasterio.open(nir_local) as nsrc:
-            # Get dimensions
+            meta = rsrc.meta.copy()
             height = rsrc.height
             width = rsrc.width
-            logging.info(f"📐 Image dimensions: {width} x {height}")
             
-            # Read with downsampling factor to reduce memory
-            out_shape = (height // 2, width // 2)  # Downsample by 2x
-            logging.info(f"📉 Downsampling to: {out_shape[1]} x {out_shape[0]}")
+            # Process in chunks to reduce memory
+            chunk_size = 1024  # Process 1024 rows at a time
+            ndvi_full = np.empty((height, width), dtype=np.float32)
             
-            red = rsrc.read(
-                1, 
-                out_shape=out_shape,
-                resampling=rasterio.enums.Resampling.average
-            ).astype("float32")
+            valid_pixels = 0
+            sum_ndvi = 0.0
+            sum_sq_ndvi = 0.0
+            min_val = float('inf')
+            max_val = float('-inf')
+            veg_pixels = 0
             
-            nir = nsrc.read(
-                1,
-                out_shape=out_shape, 
-                resampling=rasterio.enums.Resampling.average
-            ).astype("float32")
+            for i in range(0, height, chunk_size):
+                rows = min(chunk_size, height - i)
+                window = Window(0, i, width, rows)
+                
+                red = rsrc.read(1, window=window).astype('float32')
+                nir = nsrc.read(1, window=window).astype('float32')
+                
+                np.seterr(divide="ignore", invalid="ignore")
+                denominator = nir + red
+                ndvi_chunk = np.where(denominator != 0, (nir - red) / denominator, np.nan)
+                
+                ndvi_full[i:i+rows, :] = ndvi_chunk
+                
+                # Update statistics
+                valid = ~np.isnan(ndvi_chunk)
+                if valid.sum() > 0:
+                    valid_pixels += valid.sum()
+                    chunk_valid = ndvi_chunk[valid]
+                    sum_ndvi += chunk_valid.sum()
+                    sum_sq_ndvi += (chunk_valid ** 2).sum()
+                    min_val = min(min_val, chunk_valid.min())
+                    max_val = max(max_val, chunk_valid.max())
+                    veg_pixels += (chunk_valid > 0.3).sum()
+                
+                # Free memory
+                del red, nir, ndvi_chunk
             
-            meta = rsrc.meta.copy()
-            # Update metadata for downsampled size
-            meta.update({
-                'height': out_shape[0],
-                'width': out_shape[1],
-                'transform': rsrc.transform * rsrc.transform.scale(
-                    (rsrc.width / out_shape[1]),
-                    (rsrc.height / out_shape[0])
-                )
-            })
-        
-        logging.info(f"✅ Bands loaded. Shape: {red.shape}, Memory: ~{red.nbytes / 1024 / 1024:.1f}MB")
-
-        np.seterr(divide="ignore", invalid="ignore")
-        ndvi = (nir - red) / (nir + red)
-        ndvi = np.where((nir + red) == 0, np.nan, ndvi)
-
-        valid = ~np.isnan(ndvi)
-        logging.info(f"📊 Valid pixels: {valid.sum()}/{ndvi.size} ({valid.sum()/ndvi.size*100:.1f}%)")
-        
-        stats = {
-            "ndvi_min": None,
-            "ndvi_max": None,
-            "ndvi_mean": None,
-            "ndvi_std_dev": None,
-            "vegetation_coverage_percent": None,
-            "data_completeness_percent": None
-        }
-        
-        if valid.sum() > 0:
+            # Calculate final statistics
+            total_pixels = height * width
             stats = {
-                "ndvi_min": float(np.nanmin(ndvi)),
-                "ndvi_max": float(np.nanmax(ndvi)),
-                "ndvi_mean": float(np.nanmean(ndvi)),
-                "ndvi_std_dev": float(np.nanstd(ndvi)),
-                "vegetation_coverage_percent": float((ndvi > 0.3).sum() / valid.sum() * 100.0),
-                "data_completeness_percent": float(valid.sum() / ndvi.size * 100.0)
+                "ndvi_min": None,
+                "ndvi_max": None,
+                "ndvi_mean": None,
+                "ndvi_std_dev": None,
+                "vegetation_coverage_percent": None,
+                "data_completeness_percent": None
             }
-            logging.info(f"📈 NDVI stats: min={stats['ndvi_min']:.3f}, max={stats['ndvi_max']:.3f}, mean={stats['ndvi_mean']:.3f}")
-
-        logging.info(f"💾 Writing NDVI to temp file: {ndvi_tmp.name}")
-        meta.update(dtype=rasterio.float32, count=1, compress="LZW", tiled=True)
-        with rasterio.open(ndvi_tmp.name, "w", **meta) as dst:
-            dst.write(ndvi.astype(rasterio.float32), 1)
+            
+            if valid_pixels > 0:
+                mean = sum_ndvi / valid_pixels
+                variance = (sum_sq_ndvi / valid_pixels) - (mean ** 2)
+                std_dev = np.sqrt(max(0, variance))
+                
+                stats = {
+                    "ndvi_min": float(min_val),
+                    "ndvi_max": float(max_val),
+                    "ndvi_mean": float(mean),
+                    "ndvi_std_dev": float(std_dev),
+                    "vegetation_coverage_percent": float(veg_pixels / valid_pixels * 100.0),
+                    "data_completeness_percent": float(valid_pixels / total_pixels * 100.0)
+                }
+                logging.info(f"📈 NDVI stats: min={stats['ndvi_min']:.3f}, max={stats['ndvi_max']:.3f}, mean={stats['ndvi_mean']:.3f}")
+            
+            # Write NDVI
+            meta.update(dtype=rasterio.float32, count=1, compress="LZW", tiled=True, blockxsize=256, blockysize=256)
+            with rasterio.open(ndvi_tmp.name, "w", **meta) as dst:
+                dst.write(ndvi_full.astype(rasterio.float32), 1)
+            
+            # Free memory
+            del ndvi_full
 
         ndvi_b2_path = f"{B2_PREFIX}ndvi/{tile_id}/{acq_date}/ndvi.tif"
-        logging.info(f"☁️  Uploading NDVI to B2: {B2_BUCKET_NAME}/{ndvi_b2_path}")
+        logging.info(f"☁️  Uploading NDVI to B2: {ndvi_b2_path}")
         bucket.upload_local_file(local_file=ndvi_tmp.name, file_name=ndvi_b2_path)
         logging.info(f"✅ NDVI uploaded successfully")
         
         return f"b2://{B2_BUCKET_NAME}/{ndvi_b2_path}", stats
+        
     except Exception as e:
         logging.error(f"❌ NDVI computation failed: {e}\n{traceback.format_exc()}")
         return None, None
     finally:
         try: 
             os.remove(ndvi_tmp.name)
-            logging.debug(f"🧹 Removed temp NDVI file: {ndvi_tmp.name}")
-        except Exception as e:
-            logging.warning(f"⚠️ Could not remove temp NDVI file: {e}")
+        except: 
+            pass
 
 # ---------------- Main process ----------------
 def process_tile(tile):
-    """Process a single tile: fetch scene, download bands, compute NDVI, save to DB"""
+    """Process a single tile: fetch scene, download bands if needed, compute NDVI, save to DB"""
     try:
         tile_id = tile["tile_id"]
         geom_value = tile["geometry"]
-        country_id = tile.get("country_id")  # Get country_id from mgrs_tiles
-        mgrs_tile_id = tile.get("id")  # Get mgrs_tiles.id
+        country_id = tile.get("country_id")
+        mgrs_tile_id = tile.get("id")
 
         today = datetime.date.today()
         start_date = (today - datetime.timedelta(days=LOOKBACK_DAYS)).isoformat()
@@ -308,11 +378,33 @@ def process_tile(tile):
         acq_date = scene["properties"]["datetime"].split("T")[0]
         cloud_cover = scene["properties"].get("eo:cloud_cover")
         
-        exists, row = _record_exists(tile_id, acq_date)
-        if exists and row and row.get("status") in ("downloaded", "ready"):
-            logging.info(f"⏩ Skipping {tile_id} {acq_date}, already in DB with status={row.get('status')}")
-            return False
-
+        # Check if files already exist in B2
+        exists, paths = check_existing_files(tile_id, acq_date)
+        
+        # Check DB record
+        db_exists, row = _record_exists(tile_id, acq_date)
+        
+        # If all files exist in B2 and DB record exists with ready status, just update timestamp
+        if exists["red"] and exists["nir"] and exists["ndvi"] and db_exists:
+            logging.info(f"✅ All files exist for {tile_id} {acq_date}, updating timestamp only")
+            try:
+                payload = {
+                    "tile_id": tile_id,
+                    "acquisition_date": acq_date,
+                    "collection": MPC_COLLECTION.upper(),
+                    "updated_at": datetime.datetime.utcnow().isoformat() + "Z"
+                }
+                supabase.table("satellite_tiles").upsert(
+                    payload, 
+                    on_conflict="tile_id,acquisition_date,collection"
+                ).execute()
+                logging.info(f"✅ Timestamp updated for {tile_id} {acq_date}")
+                return True
+            except Exception as e:
+                logging.error(f"❌ Failed to update timestamp: {e}")
+                return False
+        
+        # Download only missing files
         assets = scene.get("assets", {})
         red_url = _signed_asset_url(assets, "red", "B04")
         nir_url = _signed_asset_url(assets, "nir", "B08")
@@ -321,43 +413,70 @@ def process_tile(tile):
             logging.warning(f"❌ Missing red/nir URLs for {tile_id} {acq_date}")
             return False
 
-        # Download + compress + upload Red/NIR
-        logging.info(f"📥 Downloading Red band for {tile_id} {acq_date}")
-        red_local, red_b2 = download_band(red_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif")
+        red_local = None
+        nir_local = None
+        red_b2 = f"b2://{B2_BUCKET_NAME}/{paths['red']}"
+        nir_b2 = f"b2://{B2_BUCKET_NAME}/{paths['nir']}"
         
-        logging.info(f"📥 Downloading NIR band for {tile_id} {acq_date}")
-        nir_local, nir_b2 = download_band(nir_url, f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif")
+        # Download Red if not exists
+        if not exists["red"]:
+            logging.info(f"📥 Downloading Red band for {tile_id} {acq_date}")
+            red_local, red_b2 = download_band(red_url, paths["red"])
+            if not red_local:
+                logging.error(f"❌ Failed to download Red for {tile_id}")
+                return False
+        else:
+            logging.info(f"✅ Red band already exists, skipping download")
         
-        if not red_local or not nir_local:
-            logging.error(f"❌ Failed to download/compress Red or NIR for {tile_id}")
-            return False
-
-        # Compute NDVI
-        logging.info(f"🧮 Computing NDVI for {tile_id} {acq_date}")
-        try:
-            ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
-            logging.info(f"📊 NDVI computation complete. B2 path: {ndvi_b2}, Stats: {stats}")
-        except Exception as ndvi_err:
-            logging.error(f"❌ NDVI computation exception for {tile_id}: {ndvi_err}")
-            logging.error(traceback.format_exc())
-            return False
+        # Download NIR if not exists
+        if not exists["nir"]:
+            logging.info(f"📥 Downloading NIR band for {tile_id} {acq_date}")
+            nir_local, nir_b2 = download_band(nir_url, paths["nir"])
+            if not nir_local:
+                logging.error(f"❌ Failed to download NIR for {tile_id}")
+                if red_local:
+                    try: os.remove(red_local)
+                    except: pass
+                return False
+        else:
+            logging.info(f"✅ NIR band already exists, skipping download")
         
-        # Cleanup temp Red/NIR after NDVI is done
-        try:
-            os.remove(red_local)
-            os.remove(nir_local)
-            logging.info(f"🧹 Cleaned up temp files for {tile_id}")
-        except Exception as cleanup_err:
-            logging.warning(f"⚠️ Cleanup warning: {cleanup_err}")
-
-        if not ndvi_b2 or stats is None:
-            logging.error(f"❌ Failed NDVI computation for {tile_id} - ndvi_b2: {ndvi_b2}, stats: {stats}")
-            return False
+        # Compute NDVI if not exists or if we downloaded new bands
+        ndvi_b2 = f"b2://{B2_BUCKET_NAME}/{paths['ndvi']}"
+        stats = None
         
-        logging.info(f"✅ NDVI ready for {tile_id} {acq_date}")
-
-        # Prepare payload with all required fields including country_id
-        logging.info(f"📝 Preparing database payload for {tile_id} {acq_date}")
+        if not exists["ndvi"] or red_local or nir_local:
+            # Need to download bands temporarily if they exist in B2 but not locally
+            temp_files_to_cleanup = []
+            
+            if not red_local:
+                logging.info(f"📥 Temporarily downloading Red for NDVI computation")
+                red_local, _ = download_band(red_url, paths["red"])
+                temp_files_to_cleanup.append(red_local)
+            
+            if not nir_local:
+                logging.info(f"📥 Temporarily downloading NIR for NDVI computation")
+                nir_local, _ = download_band(nir_url, paths["nir"])
+                temp_files_to_cleanup.append(nir_local)
+            
+            if red_local and nir_local:
+                logging.info(f"🧮 Computing NDVI for {tile_id} {acq_date}")
+                ndvi_b2, stats = compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local)
+                
+                # Cleanup
+                for f in [red_local, nir_local]:
+                    try: 
+                        if f:
+                            os.remove(f)
+                    except: 
+                        pass
+            else:
+                logging.error(f"❌ Failed to get bands for NDVI computation")
+                return False
+        else:
+            logging.info(f"✅ NDVI already exists, skipping computation")
+        
+        # Prepare DB payload
         payload = {
             "tile_id": tile_id,
             "acquisition_date": acq_date,
@@ -374,73 +493,33 @@ def process_tile(tile):
             "ndvi_calculation_timestamp": datetime.datetime.utcnow().isoformat() + "Z"
         }
         
-        # Add country_id and mgrs_tile_id (CRITICAL for foreign key constraint)
         if country_id:
             payload["country_id"] = country_id
-            logging.info(f"✅ Added country_id: {country_id}")
-        else:
-            logging.warning(f"⚠️ No country_id for tile {tile_id}")
-            
         if mgrs_tile_id:
             payload["mgrs_tile_id"] = mgrs_tile_id
-            logging.info(f"✅ Added mgrs_tile_id: {mgrs_tile_id}")
-        else:
-            logging.warning(f"⚠️ No mgrs_tile_id for tile {tile_id}")
-            
-        # Add cloud_cover if available
         if cloud_cover is not None:
             payload["cloud_cover"] = float(cloud_cover)
-            logging.info(f"☁️  Cloud cover: {cloud_cover}%")
-        
-        # Add stats only if they exist
         if stats:
             payload.update(stats)
-            logging.info(f"📊 Added NDVI stats to payload")
 
-        # Insert/Update record in Supabase
+        # Save to DB
         logging.info(f"💾 Saving record to database for {tile_id} {acq_date}")
-        logging.info(f"📋 Payload fields: {', '.join(payload.keys())}")
-        logging.debug(f"📄 Full payload: {json.dumps(payload, indent=2, default=str)}")
-        
         try:
-            # Use upsert with proper conflict handling
-            logging.info(f"🔄 Executing upsert operation...")
-            resp = supabase.table("satellite_tiles") \
-                .upsert(payload, on_conflict="tile_id,acquisition_date,collection") \
-                .execute()
-            
-            logging.info(f"✅ Upsert operation completed")
+            resp = supabase.table("satellite_tiles").upsert(
+                payload, 
+                on_conflict="tile_id,acquisition_date,collection"
+            ).execute()
             
             if resp.data:
-                record_id = resp.data[0].get('id', 'unknown')
-                logging.info(f"✅ Successfully saved {tile_id} {acq_date} (record id: {record_id})")
-                logging.info(f"📦 Response data: {resp.data[0]}")
+                logging.info(f"✅ Successfully saved {tile_id} {acq_date}")
             else:
                 logging.warning(f"⚠️ Upsert returned no data for {tile_id} {acq_date}")
-                logging.warning(f"📦 Full response: {resp}")
             
         except Exception as db_err:
-            error_msg = str(db_err)
-            logging.error(f"❌ Database operation failed for {tile_id} {acq_date}")
-            logging.error(f"💥 Error type: {type(db_err).__name__}")
-            logging.error(f"💥 Error message: {error_msg}")
-            
-            # Log specific constraint violations
-            if "foreign key" in error_msg.lower():
-                logging.error(f"⚠️ Foreign key constraint violation!")
-                logging.error(f"   tile_id: {tile_id}")
-                logging.error(f"   country_id: {country_id}")
-                logging.error(f"   mgrs_tile_id: {mgrs_tile_id}")
-            if "unique" in error_msg.lower():
-                logging.error(f"⚠️ Unique constraint violation - may be duplicate record")
-            if "null value" in error_msg.lower():
-                logging.error(f"⚠️ NULL value constraint violation")
-            
-            logging.error(f"📄 Failed payload:\n{json.dumps(payload, indent=2, default=str)}")
-            logging.error(f"🔍 Full traceback:\n{traceback.format_exc()}")
+            logging.error(f"❌ Database operation failed: {db_err}")
+            logging.error(traceback.format_exc())
             return False
 
-        logging.info(f"🎉 Record successfully saved for {tile_id} {acq_date}")
         return True
 
     except Exception as e:
@@ -455,6 +534,7 @@ def main(cloud_cover=20, lookback_days=5):
     LOOKBACK_DAYS = int(lookback_days)
 
     logging.info(f"🚀 Starting tile processing (cloud_cover<={CLOUD_COVER}%, lookback={LOOKBACK_DAYS} days)")
+    logging.info(f"💾 Memory optimization: DOWNSAMPLE_FACTOR={DOWNSAMPLE_FACTOR}")
     
     processed = 0
     tiles = fetch_agri_tiles()
