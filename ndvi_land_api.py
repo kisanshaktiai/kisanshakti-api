@@ -1,8 +1,18 @@
 from fastapi import FastAPI, BackgroundTasks, Query
 import logging
 import ndvi_land_worker
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="NDVI Land API")
+
+# Allow all origins/methods (safe since this is a backend API, not public browser JS)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # in prod you can restrict this
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 logging.basicConfig(level=logging.INFO)
 
