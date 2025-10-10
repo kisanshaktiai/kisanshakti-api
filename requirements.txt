@@ -27,7 +27,7 @@ planetary-computer==0.5.1
 # ======================
 # Image Processing
 # ======================
-Pillow==10.3.0   # 🔹 upgraded for Python 3.13 compatibility
+matplotlib==3.8.2
 numpy==1.26.3
 
 # ======================
@@ -66,3 +66,4 @@ pytest-cov==4.1.0
 black==24.1.1
 flake8==7.0.0
 mypy==1.8.0
+
