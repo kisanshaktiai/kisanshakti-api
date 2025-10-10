@@ -8,7 +8,7 @@ import logging
 import datetime
 from supabase import create_client
 import os
-import land_ndvi_worker as ndvi_worker
+import ndvi_land_worker as ndvi_worker
 
 # Initialize
 app = FastAPI(
