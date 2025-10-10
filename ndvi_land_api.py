@@ -258,4 +258,113 @@ def get_land_latest_ndvi(land_id: str):
 @app.get("/farmers/{farmer_id}/ndvi")
 def get_farmer_ndvi(
     farmer_id: str,
-    date: Optional[str] = Query(None, description="Specific date (YYYY-MM-
+    date: Optional[str] = Query(None, description="Specific date (YYYY-MM-DD)"),
+    start_date: Optional[str] = Query(None, description="Start date for range (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date for range (YYYY-MM-DD)"),
+    limit: int = Query(100, le=1000)
+):
+    """
+    Get NDVI data for all lands owned by a farmer
+    """
+    try:
+        # Get all lands for farmer
+        lands = supabase.table("lands")\
+            .select("id")\
+            .eq("farmer_id", farmer_id)\
+            .execute()
+        
+        if not lands.data:
+            raise HTTPException(status_code=404, detail="No lands found for this farmer")
+        
+        land_ids = [land["id"] for land in lands.data]
+        
+        # Get NDVI data for all lands
+        query = supabase.table("ndvi_micro_tiles")\
+            .select("*")\
+            .in_("land_id", land_ids)\
+            .order("acquisition_date", desc=True)
+        
+        if date:
+            query = query.eq("acquisition_date", date)
+        else:
+            if start_date:
+                query = query.gte("acquisition_date", start_date)
+            if end_date:
+                query = query.lte("acquisition_date", end_date)
+        
+        result = query.limit(limit).execute()
+        
+        return {
+            "farmer_id": farmer_id,
+            "land_count": len(land_ids),
+            "ndvi_records": len(result.data),
+            "data": result.data
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to get farmer NDVI: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats")
+def get_stats():
+    """
+    Get processing statistics
+    """
+    try:
+        # Total requests
+        total_requests = supabase.table("ndvi_request_queue")\
+            .select("id", count="exact")\
+            .execute()
+        
+        # Queued requests
+        queued = supabase.table("ndvi_request_queue")\
+            .select("id", count="exact")\
+            .eq("status", "queued")\
+            .execute()
+        
+        # Processing
+        processing = supabase.table("ndvi_request_queue")\
+            .select("id", count="exact")\
+            .eq("status", "processing")\
+            .execute()
+        
+        # Completed
+        completed = supabase.table("ndvi_request_queue")\
+            .select("id", count="exact")\
+            .eq("status", "completed")\
+            .execute()
+        
+        # Failed
+        failed = supabase.table("ndvi_request_queue")\
+            .select("id", count="exact")\
+            .eq("status", "failed")\
+            .execute()
+        
+        # Total NDVI records
+        ndvi_records = supabase.table("ndvi_micro_tiles")\
+            .select("id", count="exact")\
+            .execute()
+        
+        return {
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "requests": {
+                "total": total_requests.count,
+                "queued": queued.count,
+                "processing": processing.count,
+                "completed": completed.count,
+                "failed": failed.count
+            },
+            "ndvi_records": ndvi_records.count
+        }
+    
+    except Exception as e:
+        logging.error(f"Failed to get stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
