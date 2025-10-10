@@ -1,27 +1,68 @@
-# Web Framework
-fastapi
-uvicorn
+# ======================
+# Core API Framework
+# ======================
+fastapi==0.108.0
+uvicorn[standard]==0.25.0
+python-multipart==0.0.6
+pydantic==2.5.3
 
-# Optional (if still using Flask for other APIs)
-flask
-flask-cors
+# ======================
+# Database + Supabase
+# ======================
+supabase==2.3.0
+postgrest==0.13.2
 
-# Supabase + B2
-supabase
-b2sdk
-requests
+# ======================
+# Geospatial + Raster Processing
+# ======================
+rasterio==1.3.9
+GDAL==3.8.3
+shapely==2.0.2
+pyproj==3.6.1
+rio-tiler==5.0.2
+mercantile==1.2.1
+pystac-client==0.7.5
+planetary-computer==0.5.1
 
-# Satellite / Raster Processing
-shapely
-rio-tiler
-mercantile
-Pillow
-planetary-computer
-pystac-client
-rasterio
-numpy
+# ======================
+# Image Processing
+# ======================
+Pillow==10.2.0
+numpy==1.26.3
 
-# Google Earth Engine (if needed in future steps)
-earthengine-api
+# ======================
+# Cloud Storage / APIs
+# ======================
+b2sdk==1.23.0
+requests==2.31.0
+httpx==0.26.0
 
+# ======================
+# Utilities
+# ======================
+python-dotenv==1.0.0
+python-dateutil==2.8.2
 
+# ======================
+# Logging / Debugging
+# ======================
+structlog==23.2.0
+
+# ======================
+# Production Server
+# ======================
+gunicorn==21.2.0
+
+# ======================
+# Testing (optional, but recommended for staging)
+# ======================
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+
+# ======================
+# Development (optional)
+# ======================
+black==24.1.1
+flake8==7.0.0
+mypy==1.8.0
