@@ -25,6 +25,7 @@ rio-tiler==7.2.1
 mercantile==1.2.1
 pystac-client==0.8.5
 planetary-computer==1.0.0
+earthengine-api==0.1.399
 
 # ======================
 # Image Processing
@@ -67,3 +68,4 @@ pytest-cov==6.0.0
 black==24.10.0
 flake8==7.1.0
 mypy==1.13.0
+
