@@ -10,8 +10,9 @@ pydantic-core==2.27.1
 # ======================
 # Database + Supabase
 # ======================
-supabase==2.3.0
-postgrest==0.13.2
+supabase==2.9.1
+postgrest==0.17.2
+httpx==0.27.2
 
 # ======================
 # Geospatial + Raster Processing
@@ -67,3 +68,4 @@ pytest-cov==6.0.0
 black==24.10.0
 flake8==7.1.0
 mypy==1.13.0
+
