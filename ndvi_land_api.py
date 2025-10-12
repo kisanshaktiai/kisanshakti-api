@@ -1,21 +1,20 @@
 """
-NDVI Land API (v3.5)
+NDVI Land API (v3.6)
 --------------------
 FastAPI backend for managing NDVI processing requests and returning results.
 Designed for multi-tenant SaaS platforms using Supabase and shared B2 satellite tiles.
 
-Features:
-- Create queued NDVI requests (per tenant/farmer)
-- Trigger worker processing in background
-- Fetch NDVI results per land
-- Monitor job statistics and processing progress
+Updates from v3.5:
+✅ Removed unnecessary fields: cloud_coverage, date_from, date_to
+✅ Simplified /requests payload for preprocessed tiles
+✅ Fully compatible with v3.7-secure NDVI worker
 """
 
 import os
 import datetime
 import logging
-from typing import List, Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
+from typing import Optional
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 import ndvi_land_worker as worker
@@ -24,19 +23,22 @@ import ndvi_land_worker as worker
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("❌ Missing Supabase configuration environment variables.")
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # === FASTAPI APP SETUP ===
 app = FastAPI(
     title="NDVI Land Processor API",
-    version="3.5.0",
+    version="3.6.0",
     description="Handles NDVI requests, tile-based processing, and per-land result storage."
 )
 
 # Enable full cross-origin access (important for Lovable frontend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["https://*.lovableproject.com"]
+    allow_origins=["*"],  # or your domain list for production
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -54,28 +56,26 @@ def health():
         return {
             "service": "NDVI Land Processor API",
             "status": "healthy",
-            "timestamp": datetime.datetime.utcnow().isoformat()
+            "timestamp": datetime.datetime.utcnow().isoformat(),
         }
     except Exception as e:
         return {
             "service": "NDVI Land Processor API",
             "status": "unhealthy",
             "error": str(e),
-            "timestamp": datetime.datetime.utcnow().isoformat()
+            "timestamp": datetime.datetime.utcnow().isoformat(),
         }
 
 # ---------------- Create NDVI Request ----------------
 @app.post("/requests")
 def create_request(payload: dict):
-    """Queue a new NDVI request for a tenant and its lands."""
+    """
+    Queue a new NDVI request for a tenant and its lands.
+    Simplified for preprocessed B2 + MPC workflow — no cloud/date filtering.
+    """
     try:
         tenant_id = payload.get("tenant_id")
         land_ids = payload.get("land_ids", [])
-        cloud_coverage = payload.get("cloud_coverage", 20)
-        date_to = payload.get("date_to") or datetime.date.today().isoformat()
-        date_from = payload.get("date_from") or (
-            datetime.date.today() - datetime.timedelta(days=30)
-        ).isoformat()
 
         if not tenant_id:
             raise HTTPException(status_code=400, detail="tenant_id is required")
@@ -97,7 +97,7 @@ def create_request(payload: dict):
         # Get latest available satellite tile
         tile_res = (
             supabase.table("satellite_tiles")
-            .select("tile_id")
+            .select("tile_id, acquisition_date")
             .order("acquisition_date", desc=True)
             .limit(1)
             .execute()
@@ -105,6 +105,7 @@ def create_request(payload: dict):
         if not tile_res.data:
             raise HTTPException(status_code=404, detail="No satellite tiles found")
         tile_id = tile_res.data[0]["tile_id"]
+        acquisition_date = tile_res.data[0].get("acquisition_date")
 
         # Insert NDVI job into queue
         result = (
@@ -113,25 +114,24 @@ def create_request(payload: dict):
                 "tenant_id": tenant_id,
                 "land_ids": land_ids,
                 "tile_id": tile_id,
-                "date_from": date_from,
-                "date_to": date_to,
-                "cloud_coverage": cloud_coverage,
                 "status": "queued",
                 "batch_size": len(land_ids),
+                "created_at": datetime.datetime.utcnow().isoformat(),
             })
             .execute()
         )
 
         req_id = result.data[0]["id"]
-        logger.info(f"📋 NDVI request queued: {req_id} | Tenant: {tenant_id}")
+        logger.info(f"📋 NDVI request queued: {req_id} | Tenant: {tenant_id} | Tile: {tile_id}")
 
         return {
             "request_id": req_id,
+            "tenant_id": tenant_id,
             "tile_id": tile_id,
+            "acquisition_date": acquisition_date,
             "status": "queued",
             "land_count": len(land_ids),
-            "date_from": date_from,
-            "date_to": date_to,
+            "timestamp": datetime.datetime.utcnow().isoformat(),
         }
 
     except HTTPException as e:
@@ -186,7 +186,11 @@ def get_land_ndvi(land_id: str, tenant_id: Optional[str] = None, limit: int = 30
 def get_queue_status(tenant_id: Optional[str] = None):
     """Return summary of NDVI processing queue."""
     try:
-        query = supabase.table("ndvi_request_queue").select("*").order("created_at", desc=True)
+        query = (
+            supabase.table("ndvi_request_queue")
+            .select("*")
+            .order("created_at", desc=True)
+        )
         if tenant_id:
             query = query.eq("tenant_id", tenant_id)
         res = query.limit(25).execute()
