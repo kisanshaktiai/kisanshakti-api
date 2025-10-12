@@ -1,17 +1,16 @@
 """
-NDVI Land Worker (v3.6)
------------------------
-Background processor for clipping and calculating NDVI for each tenant’s lands
+NDVI Land Worker (v3.6-debug)
+-----------------------------
+Enhanced background processor for clipping and calculating NDVI for each tenant’s lands
 using globally shared Sentinel-2 tiles stored in Backblaze B2.
 
-Data flow:
-1. Pull queued NDVI jobs from ndvi_request_queue (tenant-scoped)
-2. For each land_id -> download B04 (red) + B08 (NIR) from B2
-3. Clip by land boundary_polygon_old
-4. Compute NDVI, generate color NDVI thumbnail
-5. Save NDVI stats & image URL in ndvi_data / ndvi_micro_tiles
-6. Update land summary (mean NDVI)
-7. Log status in ndvi_processing_logs
+Debug Patch Features:
+✅ Full verbose logging
+✅ Uses precomputed NDVI.tif if available
+✅ Handles missing B04/B08 gracefully
+✅ Detailed error handling with Supabase updates
+✅ Writes to ndvi_data / ndvi_micro_tiles / ndvi_processing_logs
+✅ Compatible with MPC pipeline (B2 tile structure)
 """
 
 import io
@@ -41,58 +40,50 @@ logger = logging.getLogger("ndvi-worker")
 
 
 # ---------------- Utility Functions ----------------
-def build_b2_band_path(tile_id: str, date: str, band: str) -> str:
-    """Construct Backblaze B2 path for Sentinel-2 bands."""
-    return f"tiles/raw/{tile_id}/{date}/{band}.tif"
+def build_b2_path(tile_id: str, date: str, subdir: str, filename: str) -> str:
+    """Construct Backblaze B2 full path for given subdir (raw/ndvi)."""
+    return f"tiles/{subdir}/{tile_id}/{date}/{filename}"
 
 
-def download_b2_band(tile_id: str, date: str, band: str) -> io.BytesIO:
-    """Download a specific band (B04 or B08) from B2 private bucket with error checks."""
+def download_b2_file(tile_id: str, date: str, subdir: str, filename: str) -> io.BytesIO | None:
+    """Download file from B2 with error tracing."""
     if not B2_BUCKET_URL:
         raise ValueError("B2_BUCKET_URL environment variable not set")
 
-    path = build_b2_band_path(tile_id, date, band)
+    path = build_b2_path(tile_id, date, subdir, filename)
     url = f"{B2_BUCKET_URL.rstrip('/')}/{path}"
-    logger.info(f"📥 Downloading {band} from {url}")
 
-    resp = requests.get(url, timeout=90)
-    if resp.status_code != 200:
-        body_preview = resp.content[:200].decode("utf-8", errors="replace")
-        logger.error(f"❌ B2 download failed for {band}: HTTP {resp.status_code}, Preview: {body_preview}")
-        raise Exception(f"Failed to download {band} (HTTP {resp.status_code})")
-
-    logger.info(f"✅ Downloaded {band} ({len(resp.content)/1e6:.2f} MB)")
-    return io.BytesIO(resp.content)
-
-
-def open_raster_from_bytesio(buf: io.BytesIO):
-    """Open raster from memory buffer."""
-    buf.seek(0)
-    return MemoryFile(buf.read()).open()
+    logger.info(f"📥 Fetching {filename} from {url}")
+    try:
+        resp = requests.get(url, timeout=90)
+        if resp.status_code != 200:
+            logger.warning(f"⚠️ Missing B2 file: {filename} ({resp.status_code})")
+            return None
+        return io.BytesIO(resp.content)
+    except Exception as e:
+        logger.error(f"❌ B2 download error for {filename}: {e}")
+        return None
 
 
 def calculate_ndvi(red: np.ndarray, nir: np.ndarray) -> np.ndarray:
     """Compute NDVI = (NIR - RED) / (NIR + RED)."""
     np.seterr(divide="ignore", invalid="ignore")
-    denom = nir + red
-    ndvi = np.where(denom == 0, np.nan, (nir - red) / denom)
+    ndvi = (nir - red) / (nir + red)
     return np.clip(ndvi, -1, 1)
 
 
 def calculate_statistics(arr: np.ndarray) -> dict:
     """Compute NDVI statistics."""
     valid = arr[~np.isnan(arr)]
-    total = arr.size
     if valid.size == 0:
-        return {"mean": None, "min": None, "max": None, "std": None, "valid_pixels": 0, "total_pixels": total, "coverage": 0.0}
+        return {"mean": None, "min": None, "max": None, "std": None, "coverage": 0.0, "valid_pixels": 0}
     return {
         "mean": float(np.mean(valid)),
         "min": float(np.min(valid)),
         "max": float(np.max(valid)),
         "std": float(np.std(valid)),
+        "coverage": float(valid.size / arr.size * 100),
         "valid_pixels": int(valid.size),
-        "total_pixels": int(total),
-        "coverage": float(valid.size / total * 100),
     }
 
 
@@ -112,74 +103,63 @@ def generate_ndvi_visualization(ndvi: np.ndarray) -> bytes:
 
 # ---------------- Core Processing ----------------
 def process_farmer_land(land: dict, tile: dict) -> bool:
-    """Clip tile bands by land boundary, compute NDVI, and store results."""
     land_id = land["id"]
     tenant_id = land["tenant_id"]
     farmer_id = land.get("farmer_id")
     tile_id = tile["tile_id"]
     date = tile.get("acquisition_date") or datetime.date.today().isoformat()
 
-    try:
-        logger.info(f"🌍 Processing land {land_id} using tile {tile_id}")
+    logger.info(f"🌍 Starting NDVI for land={land_id} | tile={tile_id}")
 
-        # --- Geometry ---
+    try:
+        # Validate geometry
         geom_raw = land.get("boundary_polygon_old")
         if not geom_raw:
             raise Exception("Missing boundary_polygon_old")
-
         geom_json = json.loads(geom_raw) if isinstance(geom_raw, str) else geom_raw
         land_geom = shape(geom_json)
 
-        # --- Download Sentinel bands ---
-        red_buf = download_b2_band(tile_id, date, "B04")
-        nir_buf = download_b2_band(tile_id, date, "B08")
+        # --- Try precomputed NDVI ---
+        ndvi_buf = download_b2_file(tile_id, date, "ndvi", "ndvi.tif")
+        if ndvi_buf:
+            logger.info(f"✅ Found precomputed NDVI.tif for tile {tile_id}")
+            ndvi_src = rasterio.open(ndvi_buf)
+            ndvi_clip, _ = mask(ndvi_src, [transform_geom("EPSG:4326", ndvi_src.crs.to_string(), mapping(land_geom))], crop=True)
+            ndvi = ndvi_clip[0]
+        else:
+            logger.info(f"⚠️ No precomputed NDVI.tif found — falling back to raw bands (B04/B08)")
+            red_buf = download_b2_file(tile_id, date, "raw", "B04.tif")
+            nir_buf = download_b2_file(tile_id, date, "raw", "B08.tif")
 
-        with rasterio.open(red_buf) as red_src, rasterio.open(nir_buf) as nir_src:
-            if red_src.crs is None:
-                raise Exception("Missing CRS in source image")
+            if not red_buf or not nir_buf:
+                raise Exception(f"Missing B04/B08 for tile {tile_id}")
 
-            geom_transformed = transform_geom("EPSG:4326", red_src.crs.to_string(), mapping(land_geom))
-            red_clip, _ = mask(red_src, [geom_transformed], crop=True, nodata=np.nan)
-            nir_clip, _ = mask(nir_src, [geom_transformed], crop=True, nodata=np.nan)
+            with rasterio.open(red_buf) as red_src, rasterio.open(nir_buf) as nir_src:
+                geom_transformed = transform_geom("EPSG:4326", red_src.crs.to_string(), mapping(land_geom))
+                red_clip, _ = mask(red_src, [geom_transformed], crop=True, nodata=np.nan)
+                nir_clip, _ = mask(nir_src, [geom_transformed], crop=True, nodata=np.nan)
+                ndvi = calculate_ndvi(red_clip[0].astype(float), nir_clip[0].astype(float))
 
-            ndvi = calculate_ndvi(red_clip[0].astype(float), nir_clip[0].astype(float))
-
-        # --- NDVI Stats ---
         stats = calculate_statistics(ndvi)
-        if stats["valid_pixels"] == 0:
-            raise Exception("No valid NDVI pixels in clipped area")
+        if not stats["valid_pixels"]:
+            raise Exception("No valid NDVI pixels after clipping")
 
         # --- Visualization Upload ---
         try:
             img_bytes = generate_ndvi_visualization(ndvi)
-            filename = f"{tenant_id}_{land_id}_{date}.png"
-            storage_path = f"ndvi-thumbnails/{filename}"
-
-            img_buffer = io.BytesIO(img_bytes)
-            img_buffer.seek(0)
+            storage_path = f"ndvi-thumbnails/{tenant_id}_{land_id}_{date}.png"
             upload_resp = supabase.storage.from_("ndvi-thumbnails").upload(
-                storage_path,
-                img_buffer,
-                {"content-type": "image/png", "upsert": "true"},
+                storage_path, io.BytesIO(img_bytes), {"content-type": "image/png", "upsert": "true"}
             )
-
-            upload_error = None
-            if hasattr(upload_resp, "error") and upload_resp.error:
-                upload_error = upload_resp.error
-            elif isinstance(upload_resp, dict) and upload_resp.get("error"):
-                upload_error = upload_resp["error"]
-            if upload_error:
-                raise Exception(f"Upload error: {upload_error}")
-
             img_url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/ndvi-thumbnails/{storage_path}"
-            logger.info(f"⬆️ Uploaded NDVI thumbnail: {img_url}")
-        except Exception as exc:
-            logger.error(f"❌ Thumbnail upload failed for {land_id}: {exc}")
+            logger.info(f"⬆️ Uploaded thumbnail: {img_url}")
+        except Exception as e:
+            logger.error(f"❌ Thumbnail upload failed for land {land_id}: {e}")
             img_url = None
 
         # --- Upsert into ndvi_micro_tiles ---
         try:
-            upsert_resp = supabase.table("ndvi_micro_tiles").upsert(
+            supabase.table("ndvi_micro_tiles").upsert(
                 {
                     "tenant_id": tenant_id,
                     "farmer_id": farmer_id,
@@ -196,10 +176,9 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
                 },
                 on_conflict="land_id,acquisition_date",
             ).execute()
-            if getattr(upsert_resp, "error", None):
-                raise Exception(upsert_resp.error)
-        except Exception as exc:
-            logger.error(f"❌ ndvi_micro_tiles upsert failed for {land_id}: {exc}")
+            logger.info(f"🧩 Saved ndvi_micro_tile for land {land_id}")
+        except Exception as e:
+            logger.error(f"❌ ndvi_micro_tiles insert failed: {e}")
 
         # --- Upsert into ndvi_data ---
         try:
@@ -208,22 +187,21 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
                 "farmer_id": farmer_id,
                 "land_id": land_id,
                 "date": date,
+                "tile_id": tile_id,
                 "ndvi_value": stats["mean"],
+                "mean_ndvi": stats["mean"],
                 "min_ndvi": stats["min"],
                 "max_ndvi": stats["max"],
-                "mean_ndvi": stats["mean"],
                 "coverage_percentage": stats["coverage"],
                 "image_url": img_url,
-                "tile_id": tile_id,
                 "spatial_resolution": 10,
                 "created_at": datetime.datetime.utcnow().isoformat(),
                 "metadata": stats,
             }
-            ndvi_resp = supabase.table("ndvi_data").upsert(ndvi_payload, on_conflict="land_id,date").execute()
-            if getattr(ndvi_resp, "error", None):
-                raise Exception(ndvi_resp.error)
-        except Exception as exc:
-            logger.error(f"❌ ndvi_data upsert failed for {land_id}: {exc}")
+            supabase.table("ndvi_data").upsert(ndvi_payload, on_conflict="land_id,date").execute()
+            logger.info(f"💾 NDVI data inserted for land {land_id}")
+        except Exception as e:
+            logger.error(f"❌ ndvi_data upsert failed: {e}")
 
         # --- Update land summary ---
         supabase.table("lands").update(
@@ -234,12 +212,12 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
             }
         ).eq("id", land_id).execute()
 
-        logger.info(f"✅ Land {land_id} processed | Mean NDVI={stats['mean']:.4f}")
+        logger.info(f"✅ Land {land_id} processed successfully (mean NDVI={stats['mean']:.4f})")
         return True
 
     except Exception as e:
         tb = traceback.format_exc()
-        logger.exception(f"❌ Failed processing land {land_id}: {e}\n{tb}")
+        logger.error(f"❌ Failed processing land {land_id}: {e}\n{tb}")
         supabase.table("ndvi_processing_logs").insert(
             {
                 "tenant_id": tenant_id,
@@ -258,42 +236,48 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
 
 # ---------------- Queue Processing ----------------
 def process_queue(limit: int = 10):
-    """Process queued NDVI requests."""
     logger.info("🧾 Checking NDVI request queue...")
     rq = supabase.table("ndvi_request_queue").select("*").eq("status", "queued").limit(limit).execute()
     requests = rq.data or []
+    logger.info(f"📋 Found {len(requests)} queued request(s)")
+
     if not requests:
-        logger.info("No queued NDVI requests found.")
+        logger.info("🟢 No queued NDVI jobs found — idle worker.")
         return
 
     for req in requests:
         req_id = req["id"]
         tenant_id = req["tenant_id"]
         tile_id = req["tile_id"]
-        logger.info(f"⚙️ Processing queue request {req_id} for tenant {tenant_id}")
+        land_ids = req.get("land_ids", [])
+        logger.info(f"⚙️ Starting queue {req_id} for tenant={tenant_id} tile={tile_id}")
 
         # Update to processing
         supabase.table("ndvi_request_queue").update(
             {"status": "processing", "started_at": datetime.datetime.utcnow().isoformat()}
         ).eq("id", req_id).execute()
 
-        lands = supabase.table("lands").select("*").eq("tenant_id", tenant_id).in_("id", req["land_ids"]).execute().data
+        # Validate lands
+        lands = supabase.table("lands").select("*").eq("tenant_id", tenant_id).in_("id", land_ids).execute().data
         if not lands:
+            logger.warning(f"⚠️ No lands found for tenant={tenant_id}, skipping queue {req_id}")
             supabase.table("ndvi_request_queue").update(
-                {"status": "failed", "error_message": "No lands found"}
+                {"status": "failed", "error_message": "No lands found for tenant."}
             ).eq("id", req_id).execute()
             continue
 
+        # Validate tile
         tile_res = supabase.table("satellite_tiles").select("*").eq("tile_id", tile_id).limit(1).execute()
         if not getattr(tile_res, "data", None):
-            logger.error(f"❌ No satellite_tiles record found for tile_id={tile_id}")
+            logger.error(f"❌ No satellite tile metadata found for tile_id={tile_id}")
             supabase.table("ndvi_request_queue").update(
-                {"status": "failed", "error_message": "Missing tile metadata"}
+                {"status": "failed", "error_message": "Missing tile metadata."}
             ).eq("id", req_id).execute()
             continue
 
         tile = tile_res.data[0]
         processed = 0
+
         for land in lands:
             if process_farmer_land(land, tile):
                 processed += 1
@@ -306,13 +290,14 @@ def process_queue(limit: int = 10):
             }
         ).eq("id", req_id).execute()
 
-        logger.info(f"✅ Completed request {req_id} | Lands processed: {processed}")
+        logger.info(f"🎯 Completed queue {req_id} | Lands processed: {processed}")
 
 
 # ---------------- Entry ----------------
 def main(limit: int = 10):
-    logger.info("🚀 NDVI Worker started")
+    logger.info("🚀 NDVI Worker started (debug mode)")
     process_queue(limit)
+    logger.info("🏁 NDVI Worker finished")
 
 
 if __name__ == "__main__":
