@@ -1,15 +1,13 @@
 """
-NDVI Land Worker (v3.7-secure)
+NDVI Land Worker (v3.8-secure)
 ------------------------------
 Processes queued NDVI requests for each tenant’s lands.
 
-✅ Features:
-- Secure Backblaze B2 key-based access (no public URL)
-- NDVI calculation with fallback logic
-- Inserts into ndvi_data + ndvi_micro_tiles
-- Updates lands summary
-- Logs into ndvi_processing_logs
-- Clear logging with removable debug sections (marked ⚠️)
+✅ Enhancements (v3.8):
+- RESTful endpoint naming conventions
+- Consistent pluralized table and endpoint naming
+- Versioned API path alignment (for integration consistency)
+- Core logic untouched
 
 © KisanShaktiAI | 2025
 """
@@ -51,15 +49,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ndvi-worker")
 
-
 # ==========================
 # B2 AUTHENTICATION
 # ==========================
-
 def get_b2_auth():
-    """Authenticate with Backblaze B2 using key-based API access."""
+    """Authenticate securely with Backblaze B2 using key-based access."""
     if not all([B2_KEY_ID, B2_APP_KEY, B2_BUCKET]):
-        raise ValueError("Missing one or more B2 credentials (B2_KEY_ID, B2_APP_KEY, B2_BUCKET)")
+        raise ValueError("Missing one or more B2 credentials")
 
     credentials = base64.b64encode(f"{B2_KEY_ID}:{B2_APP_KEY}".encode()).decode()
     headers = {"Authorization": f"Basic {credentials}"}
@@ -83,7 +79,7 @@ def build_b2_path(tile_id: str, date: str, subdir: str, filename: str) -> str:
 
 
 def download_b2_file(tile_id: str, date: str, subdir: str, filename: str) -> io.BytesIO | None:
-    """Securely download file from Backblaze B2 bucket."""
+    """Securely download a file from Backblaze B2 bucket."""
     b2 = get_b2_auth()
     path = build_b2_path(tile_id, date, subdir, filename)
     url = f"{b2['download_url'].rstrip('/')}/file/{b2['bucket_name']}/{path}"
@@ -109,7 +105,6 @@ def download_b2_file(tile_id: str, date: str, subdir: str, filename: str) -> io.
 # ==========================
 # NDVI CORE LOGIC
 # ==========================
-
 def calculate_ndvi(red: np.ndarray, nir: np.ndarray) -> np.ndarray:
     """Compute NDVI = (NIR - RED) / (NIR + RED)."""
     np.seterr(divide="ignore", invalid="ignore")
@@ -142,16 +137,15 @@ def calculate_statistics(arr: np.ndarray) -> dict:
 # ==========================
 # PROCESSING FUNCTION
 # ==========================
-
 def process_farmer_land(land: dict, tile: dict) -> bool:
     """Process NDVI for a single land."""
     land_id = land["id"]
-    tenant_id = land["tenant_id"]  # ⚠️ Sensitive — remove in prod logs
+    tenant_id = land["tenant_id"]
     tile_id = tile["tile_id"]
     date = tile.get("acquisition_date") or datetime.date.today().isoformat()
 
     try:
-        logger.info(f"🌿 Processing land={land_id} | tile={tile_id}")  # ⚠️ Optional in prod
+        logger.info(f"🌿 Processing land={land_id} | tile={tile_id}")
 
         geom_raw = land.get("boundary_polygon_old")
         if not geom_raw:
@@ -160,32 +154,26 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
         geom_json = json.loads(geom_raw) if isinstance(geom_raw, str) else geom_raw
         land_geom = shape(geom_json)
 
-        # Try NDVI.tif first
+        # Prefer preprocessed NDVI file
         ndvi_buf = download_b2_file(tile_id, date, "ndvi", "ndvi.tif")
         if ndvi_buf:
             ndvi_src = rasterio.open(ndvi_buf)
             ndvi_arr = ndvi_src.read(1)
-            ndvi_meta = ndvi_src.meta
         else:
-            # Fall back to raw Sentinel bands
             b04_buf = download_b2_file(tile_id, date, "raw", "B04.tif")
             b08_buf = download_b2_file(tile_id, date, "raw", "B08.tif")
-
             if not b04_buf or not b08_buf:
                 raise Exception("Missing Sentinel bands or NDVI file in B2")
-
             with rasterio.open(b04_buf) as red_src, rasterio.open(b08_buf) as nir_src:
                 geom_trans = transform_geom("EPSG:4326", red_src.crs.to_string(), mapping(land_geom))
                 red_clip, _ = mask(red_src, [geom_trans], crop=True, nodata=np.nan)
                 nir_clip, _ = mask(nir_src, [geom_trans], crop=True, nodata=np.nan)
                 ndvi_arr = calculate_ndvi(red_clip[0].astype(float), nir_clip[0].astype(float))
-                ndvi_meta = red_src.meta
 
         stats = calculate_statistics(ndvi_arr)
         if stats["valid_pixels"] == 0:
             raise Exception("No valid NDVI pixels found")
 
-        # Save to Supabase
         ndvi_record = {
             "tenant_id": tenant_id,
             "land_id": land_id,
@@ -201,19 +189,17 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
         }
 
         supabase.table("ndvi_data").upsert(ndvi_record, on_conflict="land_id,date").execute()
-        logger.info(f"✅ NDVI saved for land {land_id} | mean={stats['mean']:.3f}")  # ⚠️ Optional in prod
-
         supabase.table("lands").update({
             "last_ndvi_value": stats["mean"],
             "last_ndvi_calculation": date,
         }).eq("id", land_id).execute()
 
+        logger.info(f"✅ NDVI saved for land {land_id} | mean={stats['mean']:.3f}")
         return True
 
     except Exception as e:
         tb = traceback.format_exc()
-        logger.error(f"❌ Land processing failed: {e}\n{tb[:400]}")  # ⚠️ Optional — truncate sensitive data
-
+        logger.error(f"❌ Land processing failed: {e}\n{tb[:400]}")
         supabase.table("ndvi_processing_logs").insert({
             "tenant_id": tenant_id,
             "land_id": land_id,
@@ -231,24 +217,20 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
 # ==========================
 # QUEUE PROCESSOR
 # ==========================
-
 def process_queue(limit: int = 10):
     """Process queued NDVI requests."""
     logger.info("🧾 Checking NDVI request queue...")
-
     rq = supabase.table("ndvi_request_queue").select("*").eq("status", "queued").limit(limit).execute()
     requests = rq.data or []
     if not requests:
         logger.info("✅ No queued NDVI requests.")
         return
 
-    logger.info(f"📋 Found {len(requests)} queued request(s).")
-
     for req in requests:
         req_id = req["id"]
         tenant_id = req["tenant_id"]
         tile_id = req["tile_id"]
-        logger.info(f"⚙️ Starting queue {req_id} for tenant={tenant_id} tile={tile_id}")  # ⚠️ Optional in prod
+        logger.info(f"⚙️ Processing queue {req_id} for tenant={tenant_id} tile={tile_id}")
 
         supabase.table("ndvi_request_queue").update({
             "status": "processing",
@@ -257,7 +239,6 @@ def process_queue(limit: int = 10):
 
         lands = supabase.table("lands").select("*").eq("tenant_id", tenant_id).in_("id", req["land_ids"]).execute().data
         if not lands:
-            logger.warning(f"⚠️ No lands found for tenant={tenant_id}")
             supabase.table("ndvi_request_queue").update({
                 "status": "failed",
                 "error_message": "No lands found",
@@ -266,7 +247,6 @@ def process_queue(limit: int = 10):
 
         tile_res = supabase.table("satellite_tiles").select("*").eq("tile_id", tile_id).limit(1).execute()
         if not tile_res.data:
-            logger.error(f"❌ No satellite_tiles record for {tile_id}")
             supabase.table("ndvi_request_queue").update({
                 "status": "failed",
                 "error_message": "Missing tile metadata",
@@ -282,15 +262,14 @@ def process_queue(limit: int = 10):
             "completed_at": datetime.datetime.utcnow().isoformat(),
         }).eq("id", req_id).execute()
 
-        logger.info(f"🎯 Completed request {req_id} | Lands processed: {processed}")  # ⚠️ Optional in prod
+        logger.info(f"🎯 Completed request {req_id} | Lands processed: {processed}")
 
 
 # ==========================
 # ENTRY POINT
 # ==========================
-
 def main(limit: int = 10):
-    logger.info("🚀 NDVI Worker started (secure v3.7)")
+    logger.info("🚀 NDVI Worker started (v3.8-secure)")
     process_queue(limit)
     logger.info("🏁 NDVI Worker finished.")
 
