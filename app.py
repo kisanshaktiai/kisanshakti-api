@@ -616,11 +616,15 @@ def process_land_soilgrid(land_id: str, tenant_id: str) -> Dict[str, Any]:
             else:
                 record_clean[k] = v
 
-        # Insert into soil_health
+               # Insert into soil_health
         ins = supabase.table("soil_health").insert(record_clean).execute()
-        if ins.status_code not in (200, 201):
-            logger.error("DB insert failed: %s", ins)
-            return {"land_id": land_id, "status": "error", "error": "db_insert_failed", "db_result": str(ins)}
+
+        # ✅ Fixed Supabase response check
+        if getattr(ins, "error", None):
+            logger.error(f"DB insert failed for land {land_id}: {ins.error}")
+            return {"land_id": land_id, "status": "error", "error": str(ins.error)}
+
+        logger.info(f"✅ Soil data inserted for land {land_id}")
 
         # Update lands summary columns
         update_payload = {}
@@ -638,6 +642,7 @@ def process_land_soilgrid(land_id: str, tenant_id: str) -> Dict[str, Any]:
 
         if update_payload:
             supabase.table("lands").update(update_payload).eq("id", land_id).eq("tenant_id", tenant_id).execute()
+
 
         # return success, include a short summary of computed values & confidence
         return {
