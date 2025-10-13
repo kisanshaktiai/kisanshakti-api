@@ -186,7 +186,7 @@ async def list_requests(tenant_id: str = Query(...), limit: int = Query(50)):
             supabase.table("ndvi_request_queue")
             .select("*")
             .eq("tenant_id", tenant_id)
-            .order("requested_at", desc=True)
+            .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
