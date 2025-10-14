@@ -105,7 +105,7 @@ async def health_check():
 async def process_queue_item(request: Request):
     """
     Process a specific queue item by calling the worker.
-    This endpoint is called by the Supabase Edge Function.
+    Includes deep diagnostics for debugging NDVI failures.
     """
     try:
         body = await request.json()
@@ -114,12 +114,13 @@ async def process_queue_item(request: Request):
         land_ids = body.get("land_ids", [])
         tile_id = body.get("tile_id")
 
-        logger.info(f"🔄 Processing queue item {queue_id} for tenant {tenant_id}")
+        logger.info(f"🔄 [QUEUE] Starting NDVI queue processor")
+        logger.info(f"📦 Payload received: queue_id={queue_id}, tenant_id={tenant_id}, land_ids={len(land_ids)}, tile_id={tile_id}")
 
         if not all([queue_id, tenant_id, land_ids, tile_id]):
             raise HTTPException(status_code=400, detail="Missing required fields")
 
-        # Fetch queue item to verify it exists
+        # Verify queue entry
         queue_resp = supabase.table("ndvi_request_queue").select("*").eq("id", queue_id).execute()
         if not queue_resp.data:
             raise HTTPException(status_code=404, detail=f"Queue item {queue_id} not found")
@@ -130,43 +131,77 @@ async def process_queue_item(request: Request):
             "started_at": datetime.datetime.utcnow().isoformat(),
         }).eq("id", queue_id).execute()
 
-        # Fetch lands data
+        # Fetch lands
         lands_resp = supabase.table("lands").select("*").eq("tenant_id", tenant_id).in_("id", land_ids).execute()
         lands = lands_resp.data or []
-        
+        logger.info(f"🌾 [QUEUE] Found {len(lands)} lands for processing")
+
         if not lands:
             raise HTTPException(status_code=404, detail="No lands found for given IDs")
 
-        # Fetch tile metadata
+        # Fetch tile
         tile_resp = supabase.table("satellite_tiles").select("*").eq("tile_id", tile_id).limit(1).execute()
         if not tile_resp.data:
             raise HTTPException(status_code=404, detail=f"Tile metadata not found for {tile_id}")
 
         tile = tile_resp.data[0]
 
-        # Import worker function (ensure ndvi_land_worker.py is in same directory)
+        # Import worker
         try:
             from ndvi_land_worker import process_farmer_land
-        except ImportError:
-            logger.error("❌ Failed to import ndvi_land_worker")
-            raise HTTPException(status_code=500, detail="Worker module not available")
+        except ImportError as e:
+            logger.error(f"❌ Worker import failed: {e}")
+            raise HTTPException(status_code=500, detail="Worker module not found")
 
-        # Process each land
+        # Process lands
         processed_count = 0
         failed_lands = []
-        
+        results_summary = []
+
         for land in lands:
             try:
+                logger.info(f"▶️ [LAND] Starting processing for land_id={land['id']}")
                 success = process_farmer_land(land, tile)
+
                 if success:
                     processed_count += 1
-                    logger.info(f"✅ Processed land {land['id']}")
+                    logger.info(f"✅ [LAND] Processed successfully: {land['id']}")
                 else:
                     failed_lands.append(land['id'])
-                    logger.warning(f"⚠️ Failed to process land {land['id']}")
+                    logger.warning(f"⚠️ [LAND] Worker returned False for land_id={land['id']}")
+                    # Insert a quick trace into ndvi_processing_logs
+                    supabase.table("ndvi_processing_logs").insert({
+                        "tenant_id": tenant_id,
+                        "land_id": land["id"],
+                        "satellite_tile_id": tile.get("id"),
+                        "processing_step": "ndvi_worker_call",
+                        "step_status": "failed",
+                        "completed_at": datetime.datetime.utcnow().isoformat(),
+                        "error_message": "Worker returned False (check geometry, B2, or Supabase upsert)",
+                        "metadata": {"tile_id": tile_id, "queue_id": queue_id},
+                    }).execute()
+
+                # Record per-land result
+                results_summary.append({
+                    "land_id": land["id"],
+                    "result": "success" if success else "failed",
+                })
+
             except Exception as land_error:
-                failed_lands.append(land['id'])
-                logger.error(f"❌ Error processing land {land['id']}: {land_error}")
+                failed_lands.append(land["id"])
+                logger.error(f"❌ [LAND] Exception during process_farmer_land: {land_error}")
+                import traceback
+                supabase.table("ndvi_processing_logs").insert({
+                    "tenant_id": tenant_id,
+                    "land_id": land["id"],
+                    "satellite_tile_id": tile.get("id"),
+                    "processing_step": "ndvi_worker_call",
+                    "step_status": "failed",
+                    "completed_at": datetime.datetime.utcnow().isoformat(),
+                    "error_message": str(land_error),
+                    "error_details": {"traceback": traceback.format_exc()[:500]},
+                    "metadata": {"tile_id": tile_id, "queue_id": queue_id},
+                }).execute()
 
         # Update queue status
         final_status = "completed" if processed_count > 0 else "failed"
@@ -177,45 +212,31 @@ async def process_queue_item(request: Request):
             "last_error": f"Failed lands: {failed_lands}" if failed_lands else None,
         }).eq("id", queue_id).execute()
 
-        # Verify data was inserted
-        ndvi_check = supabase.table("ndvi_data").select("id").in_("land_id", land_ids).limit(1).execute()
-        micro_check = supabase.table("ndvi_micro_tiles").select("id").in_("land_id", land_ids).limit(1).execute()
+        logger.info(f"🎯 [QUEUE] Completed {queue_id} | processed={processed_count} | failed={len(failed_lands)}")
 
-        logger.info(f"🎯 Completed queue {queue_id}: {processed_count}/{len(lands)} lands processed")
-        logger.info(f"📊 NDVI data inserted: {len(ndvi_check.data or [])} records")
-        logger.info(f"🗺️ Micro tiles inserted: {len(micro_check.data or [])} records")
+        # Verify NDVI insertions
+        ndvi_check = supabase.table("ndvi_data").select("id").in_("land_id", land_ids).limit(5).execute()
+        micro_check = supabase.table("ndvi_micro_tiles").select("id").in_("land_id", land_ids).limit(5).execute()
+
+        logger.info(f"📊 [VERIFY] ndvi_data={len(ndvi_check.data or [])}, ndvi_micro_tiles={len(micro_check.data or [])}")
 
         return {
             "status": "success",
             "queue_id": queue_id,
             "processed_count": processed_count,
-            "total_lands": len(lands),
+            "failed_count": len(failed_lands),
             "failed_lands": failed_lands,
-            "data_verified": {
-                "ndvi_data_count": len(ndvi_check.data or []),
-                "micro_tiles_count": len(micro_check.data or []),
+            "verify": {
+                "ndvi_data": len(ndvi_check.data or []),
+                "ndvi_micro_tiles": len(micro_check.data or []),
             },
-            "message": f"Processed {processed_count}/{len(lands)} lands successfully",
+            "results": results_summary,
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"❌ Process queue error: {e}")
+        logger.error(f"❌ [QUEUE] Fatal error in process_queue_item: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        
-        # Update queue to failed if possible
-        if 'queue_id' in locals():
-            try:
-                supabase.table("ndvi_request_queue").update({
-                    "status": "failed",
-                    "last_error": str(e)[:500],
-                    "completed_at": datetime.datetime.utcnow().isoformat(),
-                }).eq("id", queue_id).execute()
-            except:
-                pass
-                
         raise HTTPException(status_code=500, detail=str(e))
 
 
