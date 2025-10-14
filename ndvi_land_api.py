@@ -144,11 +144,11 @@ async def process_queue_item(request: Request):
 
         tile = tile_resp.data[0]
 
-        # Import worker function (ensure land_clipper_worker.py is in same directory)
+        # Import worker function (ensure ndvi_land_worker.py is in same directory)
         try:
-            from land_clipper_worker import process_farmer_land
+            from ndvi_land_worker import process_farmer_land
         except ImportError:
-            logger.error("❌ Failed to import land_clipper_worker")
+            logger.error("❌ Failed to import ndvi_land_worker")
             raise HTTPException(status_code=500, detail="Worker module not available")
 
         # Process each land
