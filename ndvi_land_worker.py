@@ -244,80 +244,187 @@ def upload_thumbnail_to_supabase(land_id: str, date: str, png_bytes: bytes) -> O
 # ==========================
 def process_farmer_land(land: dict, tile: dict) -> bool:
     """
-    Process NDVI for a single land:
-     - get geometry
-     - fetch ndvi.tif from B2 or compute from raw bands
-     - crop/mask the raster to land geometry
-     - compute statistics
-     - create colorized PNG and upload
-     - upsert ndvi_data, ndvi_micro_tiles, update lands
+    Process NDVI for a single land with production-grade error handling.
+    
+    Steps:
+    1. Validate and parse land geometry
+    2. Fetch NDVI product from B2 or compute from raw bands
+    3. Mask raster to land boundary
+    4. Calculate statistics
+    5. Generate colorized PNG thumbnail
+    6. Upload to Supabase Storage
+    7. Insert into ndvi_data, ndvi_micro_tiles
+    8. Update lands table with ndvi_tested flag
+    
+    Args:
+        land: Dict with id, tenant_id, boundary polygon
+        tile: Dict with tile_id, acquisition_date, id
+        
+    Returns:
+        bool: True if successful, False otherwise
     """
     land_id = land.get("id")
     tenant_id = land.get("tenant_id")
     tile_id = tile.get("tile_id")
     date = tile.get("acquisition_date") or datetime.date.today().isoformat()
+    
+    # Initialize variables for cleanup in exception handler
+    ndvi_array = None
+    stats = None
+    image_url = None
 
     try:
-        logger.info(f"🌿 Processing land {land_id} with tile {tile_id} ({date})")
+        logger.info(f"🌿 [START] Processing land {land_id} | tile={tile_id} | date={date}")
 
-        # get geometry (prefer boundary_polygon_old like your worker used)
-        geom_raw = land.get("boundary_polygon_old") or land.get("boundary")
+        # ============================================================
+        # STEP 1: Validate and Parse Geometry with Fallbacks
+        # ============================================================
+        geom_raw = (
+            land.get("boundary_polygon_old") or 
+            land.get("boundary") or 
+            land.get("boundary_polygon")
+        )
+        
         if not geom_raw:
-            raise Exception("Missing boundary polygon for land")
+            raise ValueError(f"Missing boundary polygon for land {land_id}")
 
-        geom_json = json.loads(geom_raw) if isinstance(geom_raw, str) else geom_raw
-        land_geom = shape(geom_json)
+        # Parse geometry safely with proper error handling
+        try:
+            if isinstance(geom_raw, str):
+                geom_json = json.loads(geom_raw)
+            elif isinstance(geom_raw, dict):
+                geom_json = geom_raw
+            else:
+                raise ValueError(f"Unsupported geometry type: {type(geom_raw)}")
+            
+            land_geom = shape(geom_json)
+            logger.debug(f"✅ Parsed geometry: {land_geom.geom_type}, area={land_geom.area:.6f}")
+            
+        except json.JSONDecodeError as je:
+            raise ValueError(f"Invalid JSON in geometry: {je}")
+        except Exception as ge:
+            raise ValueError(f"Invalid geometry format: {ge}")
 
-        # Step 1: Try precomputed NDVI product
+        # Validate and fix geometry if needed
+        if not land_geom.is_valid:
+            logger.warning(f"⚠️ Invalid geometry for land {land_id}, attempting auto-fix")
+            land_geom = land_geom.buffer(0)  # Fix self-intersections
+            if not land_geom.is_valid:
+                raise ValueError(f"Could not repair invalid geometry for land {land_id}")
+            logger.info(f"✅ Geometry repaired successfully")
+
+        # Check if geometry is empty
+        if land_geom.is_empty or land_geom.area < 1e-10:
+            raise ValueError(f"Geometry is empty or too small (area={land_geom.area})")
+
+        # ============================================================
+        # STEP 2: Fetch NDVI Raster from B2 (precomputed or raw bands)
+        # ============================================================
+        logger.info(f"📥 Fetching NDVI data from B2: tile={tile_id}, date={date}")
+        
+        # Try precomputed NDVI product first
         ndvi_buf = download_b2_file(tile_id, date, "ndvi", "ndvi.tif")
-        ndvi_array = None
         ndvi_meta = None
 
         if ndvi_buf:
-            # rasterio can open a BytesIO directly via MemoryFile
-            with rasterio.io.MemoryFile(ndvi_buf.read()) as memfile:
-                with memfile.open() as src:
-                    # Transform polygon from EPSG:4326 to source CRS
-                    geom_trans = transform_geom("EPSG:4326", src.crs.to_string(), mapping(land_geom))
-                    clipped, _ = mask(src, [geom_trans], crop=True, all_touched=True, nodata=np.nan)
-                    # read returns shape (bands, h, w) — NDVI must be single band
-                    ndvi_array = clipped[0].astype(float)
-                    ndvi_meta = src.meta
-        else:
-            # Step 2: Fall back to raw bands B04 (red) & B08 (nir)
+            logger.info(f"✅ Using precomputed NDVI product")
+            try:
+                with rasterio.io.MemoryFile(ndvi_buf.read()) as memfile:
+                    with memfile.open() as src:
+                        logger.debug(f"NDVI raster: CRS={src.crs}, shape={src.shape}, dtype={src.dtypes[0]}")
+                        
+                        # Transform geometry to raster CRS
+                        geom_trans = transform_geom("EPSG:4326", src.crs.to_string(), mapping(land_geom))
+                        
+                        # Mask and crop
+                        clipped, transform = mask(src, [geom_trans], crop=True, all_touched=True, nodata=np.nan)
+                        ndvi_array = clipped[0].astype(float)
+                        ndvi_meta = src.meta
+                        
+                        logger.debug(f"Clipped NDVI shape: {ndvi_array.shape}, valid pixels: {(~np.isnan(ndvi_array)).sum()}")
+            except Exception as e:
+                logger.error(f"❌ Failed to process precomputed NDVI: {e}")
+                ndvi_buf = None  # Fall through to raw bands
+
+        # Fallback to raw bands if precomputed not available
+        if ndvi_buf is None or ndvi_array is None:
+            logger.info(f"⚙️ Computing NDVI from raw bands (B04, B08)")
+            
             b04_buf = download_b2_file(tile_id, date, "raw", "B04.tif")
             b08_buf = download_b2_file(tile_id, date, "raw", "B08.tif")
+            
             if not b04_buf or not b08_buf:
-                raise Exception("NDVI product missing and raw bands (B04/B08) unavailable in B2")
+                raise FileNotFoundError(
+                    f"NDVI product missing and raw bands unavailable in B2 "
+                    f"(tile={tile_id}, date={date})"
+                )
 
-            # Use MemoryFile to open BytesIO with rasterio
-            with rasterio.io.MemoryFile(b04_buf.read()) as red_mem, rasterio.io.MemoryFile(b08_buf.read()) as nir_mem:
-                with red_mem.open() as red_src, nir_mem.open() as nir_src:
-                    # Reproject transform geometry into red_src CRS
-                    geom_trans = transform_geom("EPSG:4326", red_src.crs.to_string(), mapping(land_geom))
-                    red_clip, _ = mask(red_src, [geom_trans], crop=True, all_touched=True, nodata=np.nan)
-                    nir_clip, _ = mask(nir_src, [geom_trans], crop=True, all_touched=True, nodata=np.nan)
-                    # select first band (index 0)
-                    red_band = red_clip[0].astype(float)
-                    nir_band = nir_clip[0].astype(float)
-                    ndvi_array = calculate_ndvi(red_band, nir_band)
-                    ndvi_meta = red_src.meta
+            try:
+                with rasterio.io.MemoryFile(b04_buf.read()) as red_mem, \
+                     rasterio.io.MemoryFile(b08_buf.read()) as nir_mem:
+                    
+                    with red_mem.open() as red_src, nir_mem.open() as nir_src:
+                        logger.debug(f"Red CRS={red_src.crs}, NIR CRS={nir_src.crs}")
+                        
+                        # Transform geometry to red band CRS
+                        geom_trans = transform_geom("EPSG:4326", red_src.crs.to_string(), mapping(land_geom))
+                        
+                        # Mask both bands
+                        red_clip, _ = mask(red_src, [geom_trans], crop=True, all_touched=True, nodata=np.nan)
+                        nir_clip, _ = mask(nir_src, [geom_trans], crop=True, all_touched=True, nodata=np.nan)
+                        
+                        # Extract first band and compute NDVI
+                        red_band = red_clip[0].astype(float)
+                        nir_band = nir_clip[0].astype(float)
+                        
+                        logger.debug(f"Red shape={red_band.shape}, NIR shape={nir_band.shape}")
+                        
+                        ndvi_array = calculate_ndvi(red_band, nir_band)
+                        ndvi_meta = red_src.meta
+                        
+            except Exception as e:
+                raise RuntimeError(f"Failed to compute NDVI from raw bands: {e}")
 
+        # Verify NDVI array was created
         if ndvi_array is None:
-            raise Exception("Failed to obtain NDVI array for land")
+            raise RuntimeError("Failed to obtain NDVI array (both precomputed and raw bands failed)")
 
-        # Statistics
+        # ============================================================
+        # STEP 3: Calculate Statistics
+        # ============================================================
+        logger.info(f"📊 Calculating NDVI statistics")
         stats = calculate_statistics(ndvi_array)
+        
         if stats["valid_pixels"] == 0:
-            raise Exception("No valid NDVI pixels after mask")
+            raise ValueError(f"No valid NDVI pixels after masking (all NaN or outside boundary)")
+        
+        logger.info(
+            f"✅ Stats: mean={stats['mean']:.3f}, min={stats['min']:.3f}, "
+            f"max={stats['max']:.3f}, coverage={stats['coverage']:.1f}%"
+        )
 
-        # Create colorized PNG bytes
+        # ============================================================
+        # STEP 4: Generate Colorized PNG Thumbnail
+        # ============================================================
+        logger.info(f"🎨 Generating colorized NDVI thumbnail")
         png_bytes = create_colorized_ndvi_png(ndvi_array, cmap_name="RdYlGn")
+        logger.debug(f"PNG size: {len(png_bytes)} bytes")
 
-        # Upload to Supabase storage
+        # ============================================================
+        # STEP 5: Upload Thumbnail to Supabase Storage
+        # ============================================================
+        logger.info(f"☁️ Uploading thumbnail to Supabase Storage")
         image_url = upload_thumbnail_to_supabase(land_id, date, png_bytes)
+        
+        if not image_url:
+            logger.warning(f"⚠️ Thumbnail upload failed, proceeding without image URL")
 
-        # Prepare NDVI record (main summary)
+        # ============================================================
+        # STEP 6: Prepare Database Records
+        # ============================================================
+        current_time = datetime.datetime.utcnow().isoformat()
+        
+        # Main NDVI data record
         ndvi_record = {
             "tenant_id": tenant_id,
             "land_id": land_id,
@@ -329,14 +436,11 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
             "ndvi_std": stats["std"],
             "coverage": stats["coverage"],
             "image_url": image_url,
-            "created_at": datetime.datetime.utcnow().isoformat(),
+            "created_at": current_time,
             "metadata": stats,
         }
 
-        # Upsert main ndvi_data table
-        supabase.table("ndvi_data").upsert(ndvi_record, on_conflict="land_id,date").execute()
-
-        # Upsert micro tile record
+        # Micro tile record
         micro_tile_record = {
             "tenant_id": tenant_id,
             "land_id": land_id,
@@ -348,40 +452,126 @@ def process_farmer_land(land: dict, tile: dict) -> bool:
             "ndvi_max": stats["max"],
             "ndvi_std": stats["std"],
             "coverage": stats["coverage"],
-            "created_at": datetime.datetime.utcnow().isoformat(),
+            "created_at": current_time,
         }
-        # Use composite conflict key if available; adjust on_conflict to your table PK/index as needed
-        supabase.table("ndvi_micro_tiles").upsert(micro_tile_record, on_conflict="land_id,acquisition_date").execute()
 
-        # Update lands summary
-        supabase.table("lands").update({
-            "last_ndvi_value": stats["mean"],
-            "last_ndvi_calculation": date,
-            "last_ndvi_image_url": image_url,
-            "updated_at": datetime.datetime.utcnow().isoformat()
-        }).eq("id", land_id).execute()
+        # ============================================================
+        # STEP 7: Insert into Database (with verification)
+        # ============================================================
+        logger.info(f"💾 Inserting NDVI data into database")
+        
+        try:
+            # Insert main NDVI data
+            ndvi_insert = supabase.table("ndvi_data").upsert(
+                ndvi_record, 
+                on_conflict="land_id,date"
+            ).execute()
+            
+            if ndvi_insert.data:
+                logger.info(f"✅ ndvi_data inserted: {len(ndvi_insert.data)} record(s)")
+            else:
+                logger.warning(f"⚠️ ndvi_data upsert returned no data (may already exist)")
 
-        logger.info(f"✅ Processed land {land_id} | mean={stats['mean']:.3f} | image_url={image_url}")
+        except Exception as db_err:
+            logger.error(f"❌ Failed to insert ndvi_data: {db_err}")
+            raise
+
+        try:
+            # Insert micro tile
+            micro_insert = supabase.table("ndvi_micro_tiles").upsert(
+                micro_tile_record, 
+                on_conflict="land_id,acquisition_date"
+            ).execute()
+            
+            if micro_insert.data:
+                logger.info(f"✅ ndvi_micro_tiles inserted: {len(micro_insert.data)} record(s)")
+            else:
+                logger.warning(f"⚠️ ndvi_micro_tiles upsert returned no data")
+
+        except Exception as db_err:
+            logger.error(f"❌ Failed to insert ndvi_micro_tiles: {db_err}")
+            raise
+
+        # ============================================================
+        # STEP 8: Update Lands Table with Flags
+        # ============================================================
+        logger.info(f"🏷️ Updating lands table with NDVI flags")
+        
+        try:
+            land_update = supabase.table("lands").update({
+                "last_ndvi_value": stats["mean"],
+                "last_ndvi_calculation": date,
+                "last_ndvi_image_url": image_url,
+                "ndvi_tested": True,  # Critical flag for tracking
+                "last_processed_at": current_time,
+                "updated_at": current_time,
+            }).eq("id", land_id).execute()
+            
+            if land_update.data:
+                logger.info(f"✅ lands table updated: {len(land_update.data)} record(s)")
+            else:
+                logger.warning(f"⚠️ lands update returned no data for land_id={land_id}")
+
+        except Exception as db_err:
+            logger.error(f"❌ Failed to update lands table: {db_err}")
+            raise
+
+        # ============================================================
+        # SUCCESS!
+        # ============================================================
+        logger.info(
+            f"🎉 [SUCCESS] Land {land_id} processed | "
+            f"mean={stats['mean']:.3f} | "
+            f"coverage={stats['coverage']:.1f}% | "
+            f"image={bool(image_url)}"
+        )
+        
         return True
 
     except Exception as e:
+        # ============================================================
+        # COMPREHENSIVE ERROR HANDLING
+        # ============================================================
         tb = traceback.format_exc()
-        logger.error(f"❌ Failed to process land {land_id}: {e}\n{tb[:400]}")
-        # Log to processing logs table
+        error_msg = str(e)[:500]  # Truncate for database storage
+        
+        logger.error(
+            f"❌ [FAILED] Land {land_id} processing failed\n"
+            f"Error: {error_msg}\n"
+            f"Traceback (first 500 chars):\n{tb[:500]}"
+        )
+
+        # Log to processing logs table for audit trail
         try:
-            supabase.table("ndvi_processing_logs").insert({
+            log_record = {
                 "tenant_id": tenant_id,
                 "land_id": land_id,
                 "satellite_tile_id": tile.get("id"),
                 "processing_step": "ndvi_calculation",
                 "step_status": "failed",
                 "completed_at": datetime.datetime.utcnow().isoformat(),
-                "error_message": str(e),
-                "error_details": {"traceback": tb[:400]},
-                "metadata": {"tile_id": tile_id, "date": date},
-            }).execute()
+                "error_message": error_msg,
+                "error_details": {
+                    "traceback": tb[:1000],
+                    "tile_id": tile_id,
+                    "date": date,
+                    "error_type": type(e).__name__,
+                    "stats": stats if stats else None,
+                    "has_ndvi_array": ndvi_array is not None,
+                },
+                "metadata": {
+                    "tile_id": tile_id,
+                    "date": date,
+                    "processing_stage": "geometry" if ndvi_array is None else "database",
+                },
+            }
+            
+            supabase.table("ndvi_processing_logs").insert(log_record).execute()
+            logger.info(f"✅ Error logged to ndvi_processing_logs")
+            
         except Exception as log_exc:
             logger.warning(f"⚠️ Failed to write processing log: {log_exc}")
+
         return False
 
 
