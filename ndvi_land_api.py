@@ -97,6 +97,126 @@ async def health_check():
         "version": "3.9.0",
         "timestamp": datetime.datetime.utcnow().isoformat(),
     }
+    
+# =====================================================
+# NDVI PROCESSING ENDPOINT (called by Edge Function)
+# =====================================================
+@app.post("/api/v1/ndvi/process-queue", tags=["NDVI Processing"])
+async def process_queue_item(request: Request):
+    """
+    Process a specific queue item by calling the worker.
+    This endpoint is called by the Supabase Edge Function.
+    """
+    try:
+        body = await request.json()
+        queue_id = body.get("queue_id")
+        tenant_id = body.get("tenant_id")
+        land_ids = body.get("land_ids", [])
+        tile_id = body.get("tile_id")
+
+        logger.info(f"🔄 Processing queue item {queue_id} for tenant {tenant_id}")
+
+        if not all([queue_id, tenant_id, land_ids, tile_id]):
+            raise HTTPException(status_code=400, detail="Missing required fields")
+
+        # Fetch queue item to verify it exists
+        queue_resp = supabase.table("ndvi_request_queue").select("*").eq("id", queue_id).execute()
+        if not queue_resp.data:
+            raise HTTPException(status_code=404, detail=f"Queue item {queue_id} not found")
+
+        # Update status to processing
+        supabase.table("ndvi_request_queue").update({
+            "status": "processing",
+            "started_at": datetime.datetime.utcnow().isoformat(),
+        }).eq("id", queue_id).execute()
+
+        # Fetch lands data
+        lands_resp = supabase.table("lands").select("*").eq("tenant_id", tenant_id).in_("id", land_ids).execute()
+        lands = lands_resp.data or []
+        
+        if not lands:
+            raise HTTPException(status_code=404, detail="No lands found for given IDs")
+
+        # Fetch tile metadata
+        tile_resp = supabase.table("satellite_tiles").select("*").eq("tile_id", tile_id).limit(1).execute()
+        if not tile_resp.data:
+            raise HTTPException(status_code=404, detail=f"Tile metadata not found for {tile_id}")
+
+        tile = tile_resp.data[0]
+
+        # Import worker function (ensure land_clipper_worker.py is in same directory)
+        try:
+            from land_clipper_worker import process_farmer_land
+        except ImportError:
+            logger.error("❌ Failed to import land_clipper_worker")
+            raise HTTPException(status_code=500, detail="Worker module not available")
+
+        # Process each land
+        processed_count = 0
+        failed_lands = []
+        
+        for land in lands:
+            try:
+                success = process_farmer_land(land, tile)
+                if success:
+                    processed_count += 1
+                    logger.info(f"✅ Processed land {land['id']}")
+                else:
+                    failed_lands.append(land['id'])
+                    logger.warning(f"⚠️ Failed to process land {land['id']}")
+            except Exception as land_error:
+                failed_lands.append(land['id'])
+                logger.error(f"❌ Error processing land {land['id']}: {land_error}")
+
+        # Update queue status
+        final_status = "completed" if processed_count > 0 else "failed"
+        supabase.table("ndvi_request_queue").update({
+            "status": final_status,
+            "processed_count": processed_count,
+            "completed_at": datetime.datetime.utcnow().isoformat(),
+            "last_error": f"Failed lands: {failed_lands}" if failed_lands else None,
+        }).eq("id", queue_id).execute()
+
+        # Verify data was inserted
+        ndvi_check = supabase.table("ndvi_data").select("id").in_("land_id", land_ids).limit(1).execute()
+        micro_check = supabase.table("ndvi_micro_tiles").select("id").in_("land_id", land_ids).limit(1).execute()
+
+        logger.info(f"🎯 Completed queue {queue_id}: {processed_count}/{len(lands)} lands processed")
+        logger.info(f"📊 NDVI data inserted: {len(ndvi_check.data or [])} records")
+        logger.info(f"🗺️ Micro tiles inserted: {len(micro_check.data or [])} records")
+
+        return {
+            "status": "success",
+            "queue_id": queue_id,
+            "processed_count": processed_count,
+            "total_lands": len(lands),
+            "failed_lands": failed_lands,
+            "data_verified": {
+                "ndvi_data_count": len(ndvi_check.data or []),
+                "micro_tiles_count": len(micro_check.data or []),
+            },
+            "message": f"Processed {processed_count}/{len(lands)} lands successfully",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Process queue error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Update queue to failed if possible
+        if 'queue_id' in locals():
+            try:
+                supabase.table("ndvi_request_queue").update({
+                    "status": "failed",
+                    "last_error": str(e)[:500],
+                    "completed_at": datetime.datetime.utcnow().isoformat(),
+                }).eq("id", queue_id).execute()
+            except:
+                pass
+                
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =====================================================
