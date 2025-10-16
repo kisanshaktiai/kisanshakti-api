@@ -148,6 +148,27 @@ def query_mpc(tile_geom, start_date, end_date):
     except Exception as e:
         logging.error(f"MPC query failed: {e}\n{traceback.format_exc()}")
         return []
+        
+# updated geojson_geometry integration
+def pick_best_scene(scenes):
+    """
+    Select the best Sentinel scene based on lowest cloud cover,
+    and most recent acquisition time.
+    """
+    try:
+        return sorted(
+            scenes,
+            key=lambda s: (
+                s["properties"].get("eo:cloud_cover", 100),
+                -datetime.datetime.fromisoformat(
+                    s["properties"]["datetime"].replace("Z", "+00:00")
+                ).timestamp()
+            )
+        )[0] if scenes else None
+    except Exception as e:
+        logging.error(f"Failed to pick best scene: {e}")
+        return None
+
 
 # ---------- (rest of helpers unchanged) ----------
 # All other functions: check_b2_file_exists, download_band, compute_and_upload_ndvi, etc.
@@ -228,3 +249,4 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
