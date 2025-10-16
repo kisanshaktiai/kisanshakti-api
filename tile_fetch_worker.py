@@ -52,18 +52,20 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ---------------- Helpers ----------------
 def fetch_agri_tiles():
-    """Get MGRS tiles where is_agri=True, including geojson_geometry"""
+    """Fetch only MGRS tiles that contain at least one farmer land."""
     try:
         resp = supabase.table("mgrs_tiles") \
-            .select("tile_id, geojson_geometry, geometry, country_id, id") \
+            .select("tile_id, geojson_geometry, country_id, id") \
             .eq("is_agri", True) \
+            .eq("is_land_contain", True) \
             .execute()
         tiles = resp.data or []
-        logging.info(f"Fetched {len(tiles)} agri tiles")
+        logging.info(f"Fetched {len(tiles)} active agricultural tiles containing lands.")
         return tiles
     except Exception as e:
-        logging.error(f"Failed to fetch agri tiles: {e}")
+        logging.error(f"Failed to fetch active tiles: {e}")
         return []
+
 
 def decode_geom_to_geojson(geom_value):
     """Decode geometry (WKB/WKT/JSON string) into GeoJSON dict"""
@@ -249,4 +251,5 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
 
