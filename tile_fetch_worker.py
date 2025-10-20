@@ -1,5 +1,5 @@
 """
-tile_fetch_worker_v1.6.0
+tile_fetch_worker_v1.6.1
 ------------------------
 Production-ready MPC → B2 → Supabase pipeline.
 Safely computes NDVI for agricultural MGRS tiles and records metadata
@@ -12,9 +12,12 @@ Fixes in this version:
 ✅ Added safe_float() helper for uniform precision
 ✅ Aligned with geojson_geometry usage
 ✅ Compatible with triggers and constraints in satellite_tiles
+✅ Fixed B2SDK stream flush warnings
+✅ Fixed NDVI division RuntimeWarning
+✅ Improved temp file cleanup
 """
 
-import os, json, datetime, tempfile, logging, traceback, requests, numpy as np
+import os, json, datetime, tempfile, logging, traceback, requests, numpy as np, warnings
 import rasterio
 from rasterio.windows import Window
 from shapely import wkb, wkt
@@ -23,6 +26,9 @@ from supabase import create_client
 import planetary_computer as pc
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
 from requests.adapters import HTTPAdapter, Retry
+
+# Suppress B2SDK stream warnings
+warnings.filterwarnings('ignore', message='I/O operation on closed file')
 
 # ------------- CONFIG -------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -173,8 +179,17 @@ def get_b2_path(tile_id, date, subdir, name):
 def upload_to_b2(local_file, b2_path):
     """Upload file to B2 and return size in bytes."""
     try:
-        bucket.upload_local_file(local_file=local_file, file_name=b2_path)
+        # Get size before upload
         size = os.path.getsize(local_file)
+        
+        # Upload with metadata
+        file_info = {'src': 'tile_worker', 'version': 'v1.6.1'}
+        bucket.upload_local_file(
+            local_file=local_file, 
+            file_name=b2_path,
+            file_infos=file_info
+        )
+        
         logger.info(f"✅ Uploaded {b2_path} ({size/1024/1024:.2f}MB)")
         return size
     except Exception as e:
@@ -201,7 +216,12 @@ def compute_ndvi(red_path, nir_path, tile_id, date):
                 window = Window(0, i, width, rows)
                 red = rsrc.read(1, window=window).astype("float32")
                 nir = nsrc.read(1, window=window).astype("float32")
-                ndvi = np.where((nir + red) != 0, (nir - red) / (nir + red), np.nan)
+                
+                # Fix: Use np.errstate to suppress division warnings
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    denominator = nir + red
+                    ndvi = np.where(denominator != 0, (nir - red) / denominator, np.nan)
+                
                 ndvi_full[i:i+rows, :] = ndvi
 
                 valid_mask = ~np.isnan(ndvi)
@@ -240,12 +260,21 @@ def compute_ndvi(red_path, nir_path, tile_id, date):
         return ndvi_tmp.name, stats
     except Exception as e:
         logger.error(f"NDVI computation failed: {e}")
+        if ndvi_tmp and os.path.exists(ndvi_tmp.name):
+            try:
+                os.unlink(ndvi_tmp.name)
+            except:
+                pass
         return None, None
 
 
 # ---------------- MAIN PROCESS ----------------
 
 def process_tile(tile):
+    red_tmp = None
+    nir_tmp = None
+    ndvi_file = None
+    
     try:
         tile_id = tile["tile_id"]
         geom_json = decode_geom_to_geojson(tile)
@@ -280,17 +309,24 @@ def process_tile(tile):
 
         # Download red band
         with session.get(red_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
             with open(red_tmp.name, "wb") as f:
                 for chunk in r.iter_content(chunk_size=512 * 1024):
                     if chunk:
                         f.write(chunk)
+        
+        # Explicitly close before upload
+        red_tmp.close()
 
         # Download nir band
         with session.get(nir_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
             with open(nir_tmp.name, "wb") as f:
                 for chunk in r.iter_content(chunk_size=512 * 1024):
                     if chunk:
                         f.write(chunk)
+        
+        nir_tmp.close()
 
         red_size = upload_to_b2(red_tmp.name, get_b2_path(tile_id, acq_date, "raw", "B04.tif"))
         nir_size = upload_to_b2(nir_tmp.name, get_b2_path(tile_id, acq_date, "raw", "B08.tif"))
@@ -351,6 +387,22 @@ def process_tile(tile):
     except Exception as e:
         logger.error(f"process_tile failed for {tile.get('tile_id')}: {e}\n{traceback.format_exc()}")
         return False
+    
+    finally:
+        # Cleanup temp files
+        for tmp_file in [red_tmp, nir_tmp]:
+            if tmp_file and hasattr(tmp_file, 'name'):
+                try:
+                    if os.path.exists(tmp_file.name):
+                        os.unlink(tmp_file.name)
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp file: {e}")
+        
+        if ndvi_file and os.path.exists(ndvi_file):
+            try:
+                os.unlink(ndvi_file)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup NDVI file: {e}")
 
 
 def main(cloud_cover=100, lookback_days=90):
