@@ -1,11 +1,10 @@
 #-------------------------------------------------
-# Tiles Fetching Worker v1.1.0
+# Tiles Fetching Worker v1.2.0
 #-------------------------------------------------
-# Update: 18/10/2025
-# - Improved Sentinel-2 fetch reliability
-# - Dynamic cloud_cover & lookback_days from frontend
-# - Added automatic L1C fallback if L2A not found
-# - Extended retry logic & better STAC logging
+# Update: 20/10/2025
+# - Adds NDVI result saving to Supabase (with upsert)
+# - Improved scene logging and Supabase safety
+# - Retains fallback, retries, and B2 setup
 #-------------------------------------------------
 
 import os, requests, json, datetime, tempfile, logging, traceback
@@ -181,6 +180,29 @@ def pick_best_scene(scenes):
         return None
 
 
+def save_tile_result(tile_id, scene_id, acq_date, cloud_cover, ndvi_mean=None, ndvi_min=None, ndvi_max=None):
+    """Save NDVI result for a tile into Supabase (with upsert)."""
+    try:
+        record = {
+            "tile_id": tile_id,
+            "scene_id": scene_id,
+            "acquisition_date": acq_date,
+            "cloud_cover": cloud_cover,
+            "ndvi_mean": ndvi_mean,
+            "ndvi_min": ndvi_min,
+            "ndvi_max": ndvi_max,
+            "processed_at": datetime.datetime.utcnow().isoformat()
+        }
+
+        resp = supabase.table("ndvi_results").upsert(record, on_conflict=["tile_id"]).execute()
+        if resp.data:
+            logging.info(f"📤 Saved NDVI result for {tile_id} → {scene_id}")
+        else:
+            logging.warning(f"⚠️ Supabase upsert returned empty for {tile_id}")
+    except Exception as e:
+        logging.error(f"❌ Failed to save NDVI result for {tile_id}: {e}")
+        logging.error(traceback.format_exc())
+
 # --------------------------------------------------
 # TILE PROCESSOR
 # --------------------------------------------------
@@ -217,11 +239,15 @@ def process_tile(tile, cloud_cover, lookback_days):
 
         acq_date = scene["properties"]["datetime"].split("T")[0]
         cc = scene["properties"].get("eo:cloud_cover")
+        scene_id = scene["id"]
 
-        logging.info(f"📦 Using scene {scene['id']} (cloud={cc}%) for {tile_id}")
+        logging.info(f"📦 Using scene {scene_id} (cloud={cc}%) for {tile_id}")
 
-        bbox = extract_bbox(geom_json)
-        # (Insert your NDVI download + processing + upload logic here)
+        # Placeholder NDVI logic (to be replaced with actual raster NDVI calc)
+        ndvi_mean, ndvi_min, ndvi_max = 0.71, 0.10, 0.93  # mock values
+
+        # Save results back to Supabase
+        save_tile_result(tile_id, scene_id, acq_date, cc, ndvi_mean, ndvi_min, ndvi_max)
 
         return True
 
@@ -261,7 +287,6 @@ def main(cloud_cover: int, lookback_days: int):
 
 
 if __name__ == "__main__":
-    # Frontend-sent values
-    cloud_cover = int(os.environ.get("RUN_CLOUD_COVER", "40"))  # frontend value
-    lookback_days = int(os.environ.get("RUN_LOOKBACK_DAYS", "30"))  # frontend value
+    cloud_cover = int(os.environ.get("RUN_CLOUD_COVER", "40"))
+    lookback_days = int(os.environ.get("RUN_LOOKBACK_DAYS", "30"))
     main(cloud_cover, lookback_days)
