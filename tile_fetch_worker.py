@@ -1,5 +1,5 @@
 """
-tile_fetch_worker_v1.6.1
+tile_fetch_worker_v1.6.2
 ------------------------
 Production-ready MPC → B2 → Supabase pipeline.
 Safely computes NDVI for agricultural MGRS tiles and records metadata
@@ -15,6 +15,7 @@ Fixes in this version:
 ✅ Fixed B2SDK stream flush warnings
 ✅ Fixed NDVI division RuntimeWarning
 ✅ Improved temp file cleanup
+✅ Fixed B2 large file upload issues
 """
 
 import os, json, datetime, tempfile, logging, traceback, requests, numpy as np, warnings
@@ -176,25 +177,57 @@ def get_b2_path(tile_id, date, subdir, name):
     return f"{B2_PREFIX}{subdir}/{tile_id}/{date}/{name}"
 
 
-def upload_to_b2(local_file, b2_path):
-    """Upload file to B2 and return size in bytes."""
-    try:
-        # Get size before upload
-        size = os.path.getsize(local_file)
-        
-        # Upload with metadata
-        file_info = {'src': 'tile_worker', 'version': 'v1.6.1'}
-        bucket.upload_local_file(
-            local_file=local_file, 
-            file_name=b2_path,
-            file_infos=file_info
-        )
-        
-        logger.info(f"✅ Uploaded {b2_path} ({size/1024/1024:.2f}MB)")
-        return size
-    except Exception as e:
-        logger.error(f"B2 upload failed: {e}")
-        return None
+def upload_to_b2(local_file, b2_path, max_retries=3):
+    """Upload file to B2 with retry logic and proper error handling."""
+    for attempt in range(max_retries):
+        try:
+            # Ensure file exists and is readable
+            if not os.path.exists(local_file):
+                logger.error(f"File does not exist: {local_file}")
+                return None
+            
+            # Get size before upload
+            size = os.path.getsize(local_file)
+            
+            # For large files (>100MB), use recommended large file upload
+            if size > 100 * 1024 * 1024:  # 100MB
+                logger.info(f"Using large file upload for {b2_path} ({size/1024/1024:.2f}MB)")
+                
+                # Open file in binary read mode with context manager
+                with open(local_file, 'rb') as file_handle:
+                    file_info = {'src': 'tile_worker', 'version': 'v1.6.2'}
+                    
+                    # Use upload_bytes for better control
+                    bucket.upload_bytes(
+                        data_bytes=file_handle.read(),
+                        file_name=b2_path,
+                        file_infos=file_info
+                    )
+            else:
+                # Standard upload for smaller files
+                file_info = {'src': 'tile_worker', 'version': 'v1.6.2'}
+                bucket.upload_local_file(
+                    local_file=local_file,
+                    file_name=b2_path,
+                    file_infos=file_info
+                )
+            
+            logger.info(f"✅ Uploaded {b2_path} ({size/1024/1024:.2f}MB)")
+            return size
+            
+        except Exception as e:
+            logger.warning(f"B2 upload attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                # Wait before retry with exponential backoff
+                import time
+                wait_time = 2 ** attempt
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"B2 upload failed after {max_retries} attempts: {e}")
+                return None
+    
+    return None
 
 
 def compute_ndvi(red_path, nir_path, tile_id, date):
@@ -308,6 +341,7 @@ def process_tile(tile):
         nir_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
 
         # Download red band
+        logger.info(f"Downloading RED band for {tile_id}...")
         with session.get(red_url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with open(red_tmp.name, "wb") as f:
@@ -315,10 +349,11 @@ def process_tile(tile):
                     if chunk:
                         f.write(chunk)
         
-        # Explicitly close before upload
+        # Explicitly close and flush before upload
         red_tmp.close()
 
         # Download nir band
+        logger.info(f"Downloading NIR band for {tile_id}...")
         with session.get(nir_url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with open(nir_tmp.name, "wb") as f:
@@ -328,11 +363,26 @@ def process_tile(tile):
         
         nir_tmp.close()
 
+        # Upload bands to B2 with retry logic
+        logger.info(f"Uploading RED band to B2 for {tile_id}...")
         red_size = upload_to_b2(red_tmp.name, get_b2_path(tile_id, acq_date, "raw", "B04.tif"))
+        if not red_size:
+            logger.error(f"Failed to upload RED band for {tile_id}")
+            return False
+        
+        logger.info(f"Uploading NIR band to B2 for {tile_id}...")
         nir_size = upload_to_b2(nir_tmp.name, get_b2_path(tile_id, acq_date, "raw", "B08.tif"))
+        if not nir_size:
+            logger.error(f"Failed to upload NIR band for {tile_id}")
+            return False
 
+        logger.info(f"Computing NDVI for {tile_id}...")
         ndvi_file, stats = compute_ndvi(red_tmp.name, nir_tmp.name, tile_id, acq_date)
-        ndvi_size = upload_to_b2(ndvi_file, get_b2_path(tile_id, acq_date, "ndvi", "ndvi.tif")) if ndvi_file else None
+        
+        ndvi_size = None
+        if ndvi_file:
+            logger.info(f"Uploading NDVI to B2 for {tile_id}...")
+            ndvi_size = upload_to_b2(ndvi_file, get_b2_path(tile_id, acq_date, "ndvi", "ndvi.tif"))
 
         total_size_mb = (red_size + nir_size + (ndvi_size or 0)) / (1024 * 1024)
         now = datetime.datetime.utcnow().isoformat() + "Z"
@@ -395,12 +445,14 @@ def process_tile(tile):
                 try:
                     if os.path.exists(tmp_file.name):
                         os.unlink(tmp_file.name)
+                        logger.debug(f"Cleaned up temp file: {tmp_file.name}")
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp file: {e}")
         
         if ndvi_file and os.path.exists(ndvi_file):
             try:
                 os.unlink(ndvi_file)
+                logger.debug(f"Cleaned up NDVI file: {ndvi_file}")
             except Exception as e:
                 logger.warning(f"Failed to cleanup NDVI file: {e}")
 
