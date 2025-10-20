@@ -133,7 +133,9 @@ def query_mpc(geom_value, start_date, end_date):
 def pick_best_scene(scenes):
     """Select lowest cloud & most recent scene."""
     try:
-        return sorted(
+        if not scenes:
+            return None
+        scenes_sorted = sorted(
             scenes,
             key=lambda s: (
                 s["properties"].get("eo:cloud_cover", 100),
@@ -141,10 +143,10 @@ def pick_best_scene(scenes):
                     s["properties"]["datetime"].replace("Z", "+00:00")
                 ).timestamp(),
             ),
-        )[0]
-        if scenes
-        else None
-    except:
+        )
+        return scenes_sorted[0]
+    except Exception as e:
+        logger.error(f"pick_best_scene failed: {e}")
         return None
 
 
@@ -453,3 +455,4 @@ def main(cloud_cover=20, lookback_days=5):
 
 if __name__ == "__main__":
     main(CLOUD_COVER, LOOKBACK_DAYS)
+
