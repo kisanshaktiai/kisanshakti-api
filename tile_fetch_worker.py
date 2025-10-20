@@ -1,10 +1,10 @@
 #-------------------------------------------------
-# Tiles Fetching & Processing Worker v1.3.1
+# Tiles Fetching & Processing Worker v1.3.2
 #-------------------------------------------------
-# - Fixes 409 (private MPC asset) using SAS signing API
-# - Fixes Supabase upsert constraint (42P10 error)
-# - Fully compatible with satellite_tiles schema
-# - Tested on Sentinel-2 L2A / L1C MPC assets
+# ✅ Fixes JSON geometry parsing (Supabase dict/jsonb issue)
+# ✅ Fixes Planetary Computer SAS signing (409 access)
+# ✅ Fixes Supabase upsert constraint
+# ✅ Compatible with satellite_tiles schema
 #-------------------------------------------------
 
 import os, json, datetime, tempfile, logging, traceback
@@ -12,32 +12,27 @@ import requests
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
-from rasterio.mask import mask
-from shapely.geometry import shape
 from supabase import create_client
+from shapely.geometry import shape
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
 from requests.adapters import HTTPAdapter, Retry
 
 # --------------------------------------------------
-# ENV + CONFIG
+# CONFIG
 # --------------------------------------------------
-
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
-B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")
+B2_KEY_ID = os.environ.get("B2_KEY_ID")
 B2_APP_KEY = os.environ.get("B2_APP_KEY")
 B2_BUCKET_NAME = os.environ.get("B2_BUCKET_RAW", "kisanshakti-ndvi-tiles")
 B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")
 
 MPC_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
 MPC_SIGN_API = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
-
 DEFAULT_COLLECTIONS = ["sentinel-2-l2a", "sentinel-2-l1c"]
-
-DOWNSAMPLE_FACTOR = int(os.environ.get("DOWNSAMPLE_FACTOR", "4"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -52,24 +47,23 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 info = InMemoryAccountInfo()
 b2_api = B2Api(info)
-b2_api.authorize_account("production", B2_APP_KEY_ID, B2_APP_KEY)
+b2_api.authorize_account("production", B2_KEY_ID, B2_APP_KEY)
 bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
 
 # --------------------------------------------------
 # HELPERS
 # --------------------------------------------------
 
-def fetch_agri_tiles():
-    try:
-        resp = supabase.table("mgrs_tiles") \
-            .select("id, tile_id, geojson_geometry, country_id") \
-            .eq("is_agri", True).eq("is_land_contain", True).execute()
-        tiles = resp.data or []
-        logging.info(f"Fetched {len(tiles)} active agricultural tiles containing lands.")
-        return tiles
-    except Exception as e:
-        logging.error(f"Failed to fetch tiles: {e}")
-        return []
+def parse_geojson(geom_value):
+    """Safely parse GeoJSON whether dict or string."""
+    if isinstance(geom_value, dict):
+        return geom_value
+    if isinstance(geom_value, str):
+        try:
+            return json.loads(geom_value)
+        except Exception:
+            return None
+    return None
 
 
 def sign_mpc_item(scene):
@@ -89,7 +83,6 @@ def sign_mpc_item(scene):
 
 
 def query_mpc(tile_geom, start_date, end_date, cloud_cover):
-    """Query Planetary Computer STAC for Sentinel scenes."""
     for coll in DEFAULT_COLLECTIONS:
         try:
             body = {
@@ -127,24 +120,22 @@ def pick_best_scene(scenes):
 
 
 def download_asset(url, dest):
-    """Download file with retries."""
-    try:
-        with session.get(url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                    f.write(chunk)
-        logging.info(f"Downloaded asset -> {dest}")
-    except Exception as e:
-        raise RuntimeError(f"Download failed: {e}")
+    """Download file to dest with retries."""
+    with session.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                f.write(chunk)
+    logging.info(f"✅ Downloaded asset -> {dest}")
 
 
 def compute_ndvi(red_path, nir_path):
-    """Compute NDVI and return path + stats."""
+    """Compute NDVI raster and return file + stats."""
     with rasterio.open(red_path) as rred, rasterio.open(nir_path) as rnir:
         red = rred.read(1).astype("float32")
         nir = rnir.read(1).astype("float32")
         ndvi = np.where((nir + red) != 0, (nir - red) / (nir + red), np.nan)
+
         stats = {
             "ndvi_min": float(np.nanmin(ndvi)),
             "ndvi_max": float(np.nanmax(ndvi)),
@@ -156,45 +147,52 @@ def compute_ndvi(red_path, nir_path):
         stats["data_completeness_percent"] = round(
             (stats["valid_pixel_count"] / stats["pixel_count"]) * 100, 2
         )
+
         out = tempfile.NamedTemporaryFile(delete=False, suffix=".tif").name
         meta = rred.meta.copy()
         meta.update({"count": 1, "dtype": "float32", "driver": "GTiff", "nodata": np.nan})
         with rasterio.open(out, "w", **meta) as dst:
             dst.write(ndvi, 1)
-        logging.info(f"NDVI written -> {out}")
+
+        logging.info(f"🧮 NDVI computed & saved -> {out}")
         return out, stats
 
 
 def upload_to_b2(local_path, dest_key):
+    """Upload local file to B2 bucket."""
     b2_key = os.path.join(B2_PREFIX, dest_key).replace("\\", "/")
     with open(local_path, "rb") as fh:
-        size = os.path.getsize(local_path)
-        bucket.upload_bytes(fh.read(), b2_key)
+        data = fh.read()
+        bucket.upload_bytes(data, b2_key)
+    size = os.path.getsize(local_path)
+    logging.info(f"📤 Uploaded {dest_key} ({size} bytes)")
     return f"b2://{B2_BUCKET_NAME}/{b2_key}", size
 
 
 def upsert_satellite_tile(record):
+    """Upsert into satellite_tiles table."""
     try:
         resp = supabase.table("satellite_tiles").upsert(
             record, on_conflict="tile_id,acquisition_date,collection"
         ).execute()
-        logging.info(
-            f"📤 Upserted satellite_tiles for tile={record.get('tile_id')} date={record.get('acquisition_date')}"
-        )
+        logging.info(f"✅ Upserted satellite_tiles: {record.get('tile_id')} ({record.get('acquisition_date')})")
         return resp
     except Exception as e:
         logging.error(f"upsert_satellite_tile error: {e}")
         logging.error(traceback.format_exc())
-        raise
 
 
 # --------------------------------------------------
-# MAIN TILE PROCESSOR
+# TILE PROCESSOR
 # --------------------------------------------------
 
 def process_tile(tile, cloud_cover, lookback_days):
     tile_id = tile.get("tile_id")
-    geom = json.loads(tile["geojson_geometry"])
+    geom = parse_geojson(tile.get("geojson_geometry"))
+    if not geom:
+        logging.warning(f"No valid geometry for {tile_id}")
+        return False
+
     today = datetime.date.today()
     start = (today - datetime.timedelta(days=lookback_days)).isoformat()
     end = today.isoformat()
@@ -222,15 +220,14 @@ def process_tile(tile, cloud_cover, lookback_days):
         logging.error(f"Missing red/nir for {scene_id}")
         return False
 
-    # download assets
     rtmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif").name
     ntmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif").name
     try:
         download_asset(red, rtmp)
         download_asset(nir, ntmp)
     except Exception as e:
-        logging.error(f"❌ Asset download failed for {tile_id}: {e}")
-        rec = {
+        logging.error(f"❌ Download failed for {tile_id}: {e}")
+        upsert_satellite_tile({
             "tile_id": tile_id,
             "acquisition_date": acq_date,
             "collection": scene.get("collection", "SENTINEL-2"),
@@ -240,20 +237,15 @@ def process_tile(tile, cloud_cover, lookback_days):
             "cloud_cover": cc,
             "mgrs_tile_id": tile.get("id"),
             "updated_at": datetime.datetime.utcnow().isoformat(),
-        }
-        upsert_satellite_tile(rec)
+        })
         return False
 
-    # compute NDVI
     ndvi_path, stats = compute_ndvi(rtmp, ntmp)
 
-    # upload
-    r_key = f"{tile_id}/{acq_date}/red.tif"
-    n_key = f"{tile_id}/{acq_date}/nir.tif"
-    ndvi_key = f"{tile_id}/{acq_date}/ndvi.tif"
-    red_b2, rs = upload_to_b2(rtmp, r_key)
-    nir_b2, ns = upload_to_b2(ntmp, n_key)
-    ndvi_b2, ds = upload_to_b2(ndvi_path, ndvi_key)
+    # Upload to B2
+    red_b2, rs = upload_to_b2(rtmp, f"{tile_id}/{acq_date}/red.tif")
+    nir_b2, ns = upload_to_b2(ntmp, f"{tile_id}/{acq_date}/nir.tif")
+    ndvi_b2, ds = upload_to_b2(ndvi_path, f"{tile_id}/{acq_date}/ndvi.tif")
 
     record = {
         "tile_id": tile_id,
@@ -268,7 +260,7 @@ def process_tile(tile, cloud_cover, lookback_days):
         "processing_completed_at": datetime.datetime.utcnow().isoformat(),
         "updated_at": datetime.datetime.utcnow().isoformat(),
         "processing_stage": "complete",
-        "mgrs_tile_id": tile["id"],
+        "mgrs_tile_id": tile.get("id"),
         "ndvi_min": stats["ndvi_min"],
         "ndvi_max": stats["ndvi_max"],
         "ndvi_mean": stats["ndvi_mean"],
@@ -281,7 +273,7 @@ def process_tile(tile, cloud_cover, lookback_days):
     }
 
     upsert_satellite_tile(record)
-    logging.info(f"✅ Completed tile {tile_id}")
+    logging.info(f"✅ Completed {tile_id}")
     return True
 
 
@@ -291,7 +283,13 @@ def process_tile(tile, cloud_cover, lookback_days):
 
 def main(cloud_cover, lookback_days):
     logging.info(f"Starting tile worker (cloud<{cloud_cover}, lookback={lookback_days})")
-    tiles = fetch_agri_tiles()
+    tiles = supabase.table("mgrs_tiles") \
+        .select("id, tile_id, geojson_geometry, country_id") \
+        .eq("is_agri", True).eq("is_land_contain", True).execute().data
+    if not tiles:
+        logging.warning("No tiles found.")
+        return
+
     processed = 0
     for i, t in enumerate(tiles, start=1):
         logging.info(f"[{i}/{len(tiles)}] Processing {t['tile_id']}")
