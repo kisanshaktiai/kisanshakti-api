@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-tile_fetch_worker_v1.7.0_reliant_streamfix.py
+tile_fetch_worker_v1.7.1_fixed.py
 
-- Reliable MPC -> B2 -> Supabase worker
-- Streamed recompression and NDVI calculation (low memory)
-- Always upserts satellite_tiles (marks failed where appropriate)
-- Uses geojson_geometry for MPC queries (geometry still preserved in DB)
+CRITICAL FIX: Resolved profile_src_path issue when downloading from B2
+- Fixed: Use .name attribute for temp file paths (not file objects)
+- Ensures proper rasterio file handling for NDVI computation
 """
 
 import os
@@ -30,11 +29,11 @@ from b2sdk.v2 import InMemoryAccountInfo, B2Api
 from requests.adapters import HTTPAdapter, Retry
 
 # ---- Tunables (via env) ----
-TIFF_COMPRESSION = os.getenv("TIFF_COMPRESSION", "LZW")   # LZW recommended
-BLOCK_ROWS = int(os.getenv("BLOCK_ROWS", "1024"))         # rows processed per block
+TIFF_COMPRESSION = os.getenv("TIFF_COMPRESSION", "LZW")
+BLOCK_ROWS = int(os.getenv("BLOCK_ROWS", "1024"))
 B2_UPLOAD_RETRIES = int(os.getenv("B2_UPLOAD_RETRIES", "3"))
-B2_LARGE_THRESHOLD = int(os.getenv("B2_LARGE_THRESHOLD_BYTES", str(100 * 1024 * 1024)))  # 100MB
-DOWNSAMPLE_FACTOR = int(os.getenv("DOWNSAMPLE_FACTOR", "1"))  # >1 reduces resolution to save memory
+B2_LARGE_THRESHOLD = int(os.getenv("B2_LARGE_THRESHOLD_BYTES", str(100 * 1024 * 1024)))
+DOWNSAMPLE_FACTOR = int(os.getenv("DOWNSAMPLE_FACTOR", "1"))
 
 # ---- Config (required envs) ----
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -49,7 +48,7 @@ LOOKBACK_DAYS_DEFAULT = int(os.getenv("MAX_SCENE_LOOKBACK_DAYS", "90"))
 
 # ---- Logging ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("tile_worker_v1.7.0")
+logger = logging.getLogger("tile_worker_v1.7.1")
 
 # ---- Validate envs ----
 if not (SUPABASE_URL and SUPABASE_KEY and B2_KEY_ID and B2_APP_KEY):
@@ -106,12 +105,10 @@ def decode_geom_to_geojson(tile_row: dict):
             s = geom.strip()
             if s.startswith("{") and s.endswith("}"):
                 return json.loads(s)
-            # try WKT
             try:
                 return mapping(wkt.loads(s))
             except Exception:
                 pass
-            # try hex WKB
             try:
                 return mapping(wkb.loads(bytes.fromhex(s)))
             except Exception:
@@ -150,7 +147,6 @@ def upload_local_file_with_retries(local_path: str, b2_name: str, max_attempts: 
                 logger.error("Upload failed: local file missing: %s", local_path)
                 return None
             size = os.path.getsize(local_path)
-            # prefer upload_local_file (streams from disk)
             bucket.upload_local_file(local_file=local_path, file_name=b2_name)
             logger.info("✅ Uploaded %s (%.2fMB)", b2_name, size / 1024.0 / 1024.0)
             return int(size)
@@ -174,10 +170,7 @@ def recompress_tif_streamed(input_path: str, compression: str = TIFF_COMPRESSION
     try:
         with rasterio.open(input_path) as src:
             meta = src.meta.copy()
-            # optionally downsample by integer factor
             if DOWNSAMPLE_FACTOR > 1:
-                # We'll write full-size meta but we'll resample when reading blocks below.
-                # Simpler: create smaller output by adjusting height/width/transform
                 new_h = src.height // DOWNSAMPLE_FACTOR
                 new_w = src.width // DOWNSAMPLE_FACTOR
                 transform = src.transform * src.transform.scale(
@@ -185,23 +178,19 @@ def recompress_tif_streamed(input_path: str, compression: str = TIFF_COMPRESSION
                     (src.height / new_h)
                 )
                 meta.update(height=new_h, width=new_w, transform=transform)
-            # ensure tiled + compression
             meta.update(tiled=True, compress=compression, blockxsize=256, blockysize=256)
 
             with rasterio.open(out_tmp.name, "w", **meta) as dst:
                 height = src.height
                 width = src.width
                 band_count = src.count
-                # iterate windows; if downsampling, read window and resample using rasterio's read(..., out_shape=...)
                 for row_start in range(0, height, BLOCK_ROWS):
                     nrows = min(BLOCK_ROWS, height - row_start)
                     window = Window(0, row_start, width, nrows)
                     if DOWNSAMPLE_FACTOR > 1:
-                        # compute out_shape corresponding to the destination (scaled rows)
                         out_rows = max(1, nrows // DOWNSAMPLE_FACTOR)
                         out_shape = (band_count, out_rows, max(1, width // DOWNSAMPLE_FACTOR))
                         data = src.read(window=window, out_shape=out_shape, resampling=rasterio.enums.Resampling.average)
-                        # compute target window in dst
                         dst_row_start = row_start // DOWNSAMPLE_FACTOR
                         dst_window = Window(0, dst_row_start, out_shape[2], out_shape[1])
                         dst.write(data, window=dst_window)
@@ -358,7 +347,17 @@ def _record_exists_in_db(tile_id: str, acq_date: str, collection: Optional[str] 
 
 # ---- Core processing ----
 def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookback_days: int = LOOKBACK_DAYS_DEFAULT) -> bool:
-    red_tmp = nir_tmp = red_cmp = nir_cmp = ndvi_file = None
+    """
+    Main workflow:
+    1. Fetch tile from mgrs_tiles table
+    2. Query MPC for best satellite scene
+    3. Download RED & NIR bands from MPC
+    4. Compress bands and upload to B2
+    5. Calculate NDVI from bands
+    6. Compress NDVI and upload to B2
+    7. Store all metadata in satellite_tiles table
+    """
+    red_tmp_path = nir_tmp_path = red_cmp = nir_cmp = ndvi_file = None
     red_size = nir_size = ndvi_size = None
     stats = None
     acq_date = None
@@ -399,7 +398,6 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
             logger.error("Missing red/nir asset href for tile %s scene %s", tile_id, scene.get("id"))
             return False
 
-        # sign urls (SAS) if possible
         try:
             red_url = pc.sign(red_href)
         except Exception:
@@ -421,7 +419,6 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
         db_exists, db_row = _record_exists_in_db(tile_id, acq_date, MPC_COLLECTION.upper())
         original_created_at = db_row.get("created_at") if db_row else None
 
-        # If all exist and DB exists, update timestamp and skip
         if red_exists and nir_exists and ndvi_exists and db_exists:
             logger.info("All files exist for %s %s; updating timestamp only", tile_id, acq_date)
             try:
@@ -435,55 +432,50 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
                 return True
             except Exception as e:
                 logger.warning("DB timestamp update failed: %s", e)
-                # continue to attempt processing if DB update fails
 
-        # === Download bands if missing locally ===
+        # === Download bands if missing ===
         if not red_exists:
             red_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
             red_tmp.close()
-            logger.info("Downloading RED for %s -> %s", tile_id, red_tmp.name)
+            red_tmp_path = red_tmp.name
+            logger.info("Downloading RED for %s -> %s", tile_id, red_tmp_path)
             with session.get(red_url, stream=True, timeout=120) as r:
                 r.raise_for_status()
-                with open(red_tmp.name, "wb") as f:
+                with open(red_tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=512 * 1024):
                         if chunk:
                             f.write(chunk)
         else:
-            logger.info("RED exists in B2; will download from B2 if needed for NDVI computation")
+            logger.info("RED exists in B2; downloading for NDVI computation")
+            red_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+            red_tmp.close()
+            red_tmp_path = red_tmp.name
+            bucket.download_file_by_name(red_b2_key, red_tmp_path)
 
         if not nir_exists:
             nir_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
             nir_tmp.close()
-            logger.info("Downloading NIR for %s -> %s", tile_id, nir_tmp.name)
+            nir_tmp_path = nir_tmp.name
+            logger.info("Downloading NIR for %s -> %s", tile_id, nir_tmp_path)
             with session.get(nir_url, stream=True, timeout=120) as r:
                 r.raise_for_status()
-                with open(nir_tmp.name, "wb") as f:
+                with open(nir_tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=512 * 1024):
                         if chunk:
                             f.write(chunk)
         else:
-            logger.info("NIR exists in B2; will download from B2 if needed for NDVI computation")
-
-        # If existed in B2 and we didn't download, fetch locally for computation
-        if red_exists and not red_tmp:
-            red_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
-            red_tmp.close()
-            logger.info("Downloading RED from B2 for computation: %s", red_b2_key)
-            bucket.download_file_by_name(red_b2_key, red_tmp.name)
-
-        if nir_exists and not nir_tmp:
+            logger.info("NIR exists in B2; downloading for NDVI computation")
             nir_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
             nir_tmp.close()
-            logger.info("Downloading NIR from B2 for computation: %s", nir_b2_key)
-            bucket.download_file_by_name(nir_b2_key, nir_tmp.name)
+            nir_tmp_path = nir_tmp.name
+            bucket.download_file_by_name(nir_b2_key, nir_tmp_path)
 
-        # === Recompress & Upload raw bands if they weren't in B2 ===
+        # === Recompress & Upload raw bands if not in B2 ===
         if not red_exists:
             logger.info("Recompressing RED for %s", tile_id)
-            red_cmp = recompress_tif_streamed(red_tmp.name, compression=TIFF_COMPRESSION)
+            red_cmp = recompress_tif_streamed(red_tmp_path, compression=TIFF_COMPRESSION)
             if not red_cmp:
                 logger.error("Failed recompress RED for %s", tile_id)
-                # make sure to attempt a DB upsert marking failure below
                 raise Exception("Failed recompress RED")
             red_size = upload_local_file_with_retries(red_cmp, red_b2_key)
             if not red_size:
@@ -493,7 +485,7 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
 
         if not nir_exists:
             logger.info("Recompressing NIR for %s", tile_id)
-            nir_cmp = recompress_tif_streamed(nir_tmp.name, compression=TIFF_COMPRESSION)
+            nir_cmp = recompress_tif_streamed(nir_tmp_path, compression=TIFF_COMPRESSION)
             if not nir_cmp:
                 raise Exception("Failed recompress NIR")
             nir_size = upload_local_file_with_retries(nir_cmp, nir_b2_key)
@@ -504,17 +496,21 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
 
         # === NDVI computation (streamed) ===
         logger.info("Computing NDVI for %s", tile_id)
-        # pick a profile source for NDVI output (prefer compressed versions)
-        profile_src_path = red_cmp or red_tmp or nir_cmp or nir_tmp
+        
+        # CRITICAL FIX: Use string paths, not file objects
+        profile_src_path = red_cmp or red_tmp_path or nir_cmp or nir_tmp_path
         if not profile_src_path:
             raise Exception("No band available to build profile")
+        
         with rasterio.open(profile_src_path) as psrc:
             profile = psrc.profile.copy()
 
-        ndvi_file, stats = compute_ndvi_streamed_and_write(red_tmp.name, nir_tmp.name, profile)
+        # Use the actual temp file paths for NDVI computation
+        ndvi_file, stats = compute_ndvi_streamed_and_write(red_tmp_path, nir_tmp_path, profile)
         if not ndvi_file:
             raise Exception("NDVI computation failed")
-        # upload NDVI if absent in B2
+        
+        # Upload NDVI if absent in B2
         if not ndvi_exists:
             ndvi_size = upload_local_file_with_retries(ndvi_file, ndvi_b2_key)
             if not ndvi_size:
@@ -560,7 +556,6 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
             payload["created_at"] = now
 
         if stats:
-            # stats already rounded in compute step
             payload.update({
                 "ndvi_min": safe_float(stats.get("ndvi_min"), 3),
                 "ndvi_max": safe_float(stats.get("ndvi_max"), 3),
@@ -573,13 +568,11 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
                 "vegetation_health_score": safe_float(stats.get("vegetation_health_score"), 2),
             })
 
-        # Upsert into DB
         try:
             resp = supabase.table("satellite_tiles").upsert(payload, on_conflict="tile_id,acquisition_date,collection").execute()
             logger.info("✅ DB upsert complete for %s %s", tile_id, acq_date)
         except Exception as e:
             logger.error("DB upsert failed for %s: %s\n%s", tile_id, e, traceback.format_exc())
-            # In the unlikely case supabase client fails, still return failure to trigger manual review
             return False
 
         return True
@@ -587,7 +580,6 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
     except Exception as e:
         logger.error("process_tile failed for %s: %s\n%s", tile_row.get("tile_id"), e, traceback.format_exc())
 
-        # Ensure we persist a db record marking failure with available metadata
         try:
             now = datetime.datetime.utcnow().isoformat() + "Z"
             partial = {
@@ -603,7 +595,6 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
                 "country_id": tile_row.get("country_id"),
                 "mgrs_tile_id": tile_row.get("id"),
             }
-            # include sizes where available
             if red_size:
                 partial["red_band_size_bytes"] = to_int(red_size)
             if nir_size:
@@ -611,7 +602,6 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
             if ndvi_size:
                 partial["ndvi_size_bytes"] = to_int(ndvi_size)
 
-            # ensure created_at set if possible
             try:
                 db_exists, db_row = _record_exists_in_db(tile_row.get("tile_id"), partial["acquisition_date"], MPC_COLLECTION.upper())
                 if db_exists and db_row and db_row.get("created_at"):
@@ -629,10 +619,8 @@ def process_tile(tile_row: dict, cloud_cover: int = CLOUD_COVER_DEFAULT, lookbac
         return False
 
     finally:
-        # cleanup all temporary files (check names)
-        for p in (red_tmp and getattr(red_tmp, "name", None),
-                  nir_tmp and getattr(nir_tmp, "name", None),
-                  red_cmp, nir_cmp, ndvi_file):
+        # Cleanup all temporary files
+        for p in (red_tmp_path, nir_tmp_path, red_cmp, nir_cmp, ndvi_file):
             if p and isinstance(p, str):
                 try:
                     if os.path.exists(p):
@@ -656,7 +644,18 @@ def fetch_agri_tiles():
 
 
 def main(cloud_cover: int = CLOUD_COVER_DEFAULT, lookback_days: int = LOOKBACK_DAYS_DEFAULT):
-    logger.info("🚀 Starting tile worker v1.7.0 (cloud<%s, lookback=%s days)", cloud_cover, lookback_days)
+    """
+    Main workflow orchestration:
+    1. Fetch agricultural tiles from mgrs_tiles table
+    2. For each tile:
+       - Query Microsoft Planetary Computer for best satellite scene
+       - Download RED (B04) and NIR (B08) bands
+       - Compress bands using LZW and upload to B2 cloud storage
+       - Calculate NDVI from RED/NIR bands
+       - Compress NDVI and upload to B2
+       - Store all metadata and statistics in satellite_tiles table
+    """
+    logger.info("🚀 Starting tile worker v1.7.1 (cloud<%s, lookback=%s days)", cloud_cover, lookback_days)
     tiles = fetch_agri_tiles()
     if not tiles:
         logger.info("No tiles to process.")
