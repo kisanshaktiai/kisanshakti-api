@@ -6,7 +6,7 @@ import traceback
 import threading
 
 # Import your main NDVI worker script
-import tile_fetch_worker_v1_7_1_fixed as tile_fetch_worker
+import tile_fetch_worker as tile_fetch_worker
 
 # ------------------------------------------------------
 # ✅ FastAPI App Setup
