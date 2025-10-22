@@ -1,13 +1,17 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # File: worker.py  (NDVI processor)
-# Version: 1.8.0
+# Version: 1.8.1
 # Purpose: Fetch Sentinel-2 scenes from Microsoft Planetary Computer for
 #          MGRS polygons in `mgrs_tiles`, compute NDVI, upload artifacts to B2,
 #          and upsert metadata into `satellite_tiles` with dedup by acquisition
 #          date per (tile_id, collection).
 # Design goals: low memory (≤512 MB), resumable, idempotent, scalable.
+# Changes in this file:
+# - removed `from __future__ import annotations`
+# - added more defensive checks, explicit supabase response logging
+# - ensure we upsert a 'ready' record even if NDVI already exists in B2
+# - improved B2 existence logic to tolerate API quirks
 # ──────────────────────────────────────────────────────────────────────────────
-from __future__ import annotations
 
 import os
 import io
@@ -133,8 +137,11 @@ def _b2_key(tile_id: str, acq_date: str, subdir: str, name: str) -> str:
 def _b2_exists(name: str) -> Tuple[bool, Optional[int]]:
     try:
         info = _bucket.get_file_info_by_name(name)
-        return True, int(getattr(info, "size", 0))
-    except Exception:
+        size = int(getattr(info, "size", 0))
+        return True, size
+    except Exception as e:
+        # Be verbose for debugging B2 quirks
+        logger.debug("B2 exists check failed for %s: %s", name, e)
         return False, None
 
 
@@ -150,7 +157,7 @@ def _b2_upload(local_path: str, b2_name: str) -> Optional[int]:
             logger.info("⬆️  Uploaded %s (%.2f MB)", b2_name, size / 1024 / 1024)
             return size
         except Exception as e:
-            logger.warning("upload attempt %d failed: %s", attempt, e)
+            logger.warning("upload attempt %d failed for %s: %s", attempt, b2_name, e)
             if attempt == B2_UPLOAD_RETRIES:
                 logger.error("❌ upload failed for %s", b2_name)
             time.sleep(2 ** attempt)
@@ -182,24 +189,28 @@ def _get_tiles(filter_tile_ids: Optional[List[str]], limit: Optional[int]) -> Li
         q = q.in_("tile_id", filter_tile_ids)
     if limit:
         q = q.limit(limit)
-    data = q.execute().data or []
+    resp = q.execute()
+    data = resp.data if hasattr(resp, "data") else []
     logger.info("Fetched %d candidate tiles", len(data))
     return data
 
 
 def _get_latest_acq_date(tile_id: str, collection: str) -> Optional[str]:
     """Return the latest acquisition_date we already have in satellite_tiles for a tile_id+collection."""
-    resp = (
-        _supabase.table("satellite_tiles")
-        .select("acquisition_date")
-        .eq("tile_id", tile_id)
-        .eq("collection", collection.upper())
-        .order("acquisition_date", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if resp.data:
-        return resp.data[0]["acquisition_date"]
+    try:
+        resp = (
+            _supabase.table("satellite_tiles")
+            .select("acquisition_date")
+            .eq("tile_id", tile_id)
+            .eq("collection", collection.upper())
+            .order("acquisition_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return resp.data[0].get("acquisition_date")
+    except Exception as e:
+        logger.warning("Could not fetch latest acquisition for %s: %s", tile_id, e)
     return None
 
 
@@ -227,8 +238,8 @@ def _search_latest_scene(geom: Dict, cloud_cover: int, lookback_days: int) -> Op
     feats = r.json().get("features", [])
     if not feats:
         return None
-    # Prefer newest by datetime; if tie, lowest cloud
-    feats.sort(key=lambda f: (f["properties"]["datetime"], -float("inf" if f["properties"].get("eo:cloud_cover") is None else -f["properties"].get("eo:cloud_cover"))), reverse=True)
+    # Prefer newest by datetime; secondary sort by cloud (lowest)
+    feats.sort(key=lambda f: (f["properties"].get("datetime", ""), -float(f["properties"].get("eo:cloud_cover", 1000))), reverse=True)
     return feats[0]
 
 
@@ -241,8 +252,6 @@ def _compute_ndvi_stream(red_path: str, nir_path: str, out_path: str) -> Dict:
 
     with rasterio.open(red_path) as rsrc:
         profile = rsrc.profile.copy()
-        transform = rsrc.transform
-        crs = rsrc.crs
         width, height = rsrc.width, rsrc.height
 
     # Output profile: float32, tiled, compressed
@@ -334,11 +343,13 @@ def _download_asset(url: str, out_path: str) -> None:
         r.raise_for_status()
         with open(out_path, "wb") as f:
             for chunk in r.iter_content(1024 * 512):
+                if not chunk:
+                    continue
                 f.write(chunk)
 
 
 def _process_one(tile: Dict, cloud_cover: int, lookback_days: int, force: bool) -> bool:
-    tile_id = tile["tile_id"]
+    tile_id = tile.get("tile_id")
     geom = _decode_geom_to_geojson(tile)
     if not geom:
         logger.warning("Tile %s has no geometry, skipping", tile_id)
@@ -359,10 +370,16 @@ def _process_one(tile: Dict, cloud_cover: int, lookback_days: int, force: bool) 
         return False
 
     assets = scene.get("assets", {})
-    red_href = assets.get("red", assets.get("B04", {})).get("href")
-    nir_href = assets.get("nir", assets.get("B08", {})).get("href")
-    if not red_href or not nir_href:
+    red_asset = assets.get("red") or assets.get("B04")
+    nir_asset = assets.get("nir") or assets.get("B08")
+    if not red_asset or not nir_asset:
         logger.warning("Missing red/nir assets for %s scene %s", tile_id, acq_date)
+        return False
+
+    red_href = red_asset.get("href")
+    nir_href = nir_asset.get("href")
+    if not red_href or not nir_href:
+        logger.warning("Missing href in red/nir assets for %s", tile_id)
         return False
 
     red_url = pc.sign(red_href)
@@ -375,16 +392,35 @@ def _process_one(tile: Dict, cloud_cover: int, lookback_days: int, force: bool) 
 
     # If NDVI already exists in B2 and record exists for that date, skip (idempotent)
     exists_ndvi, _ = _b2_exists(ndvi_key)
-    if exists_ndvi and not force:
-        logger.info("NDVI already in B2 for %s %s, skipping", tile_id, acq_date)
-        return False
+    # Ensure we still upsert a metadata row if NDVI exists but DB row missing
 
-    # 3) Download with low memory footprint
     red_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif"); red_tmp.close()
     nir_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif"); nir_tmp.close()
     ndvi_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif"); ndvi_tmp.close()
 
     try:
+        if exists_ndvi and not force:
+            logger.info("NDVI already in B2 for %s %s, attempting DB upsert if missing", tile_id, acq_date)
+            # try to upsert metadata referencing existing NDVI path
+            now_iso = datetime.datetime.datetime.utcnow().isoformat() + "Z"
+            bbox = _extract_bbox(geom)
+            payload = {
+                "tile_id": tile_id,
+                "acquisition_date": acq_date,
+                "collection": MPC_COLLECTION.upper(),
+                "ndvi_path": f"b2://{B2_BUCKET_NAME}/{ndvi_key}",
+                "status": "ready",
+                "updated_at": now_iso,
+                "processing_completed_at": now_iso,
+                "ndvi_calculation_timestamp": now_iso,
+                "bbox": json.dumps(bbox),
+                "mgrs_tile_id": tile.get("id"),
+                "country_id": tile.get("country_id"),
+            }
+            resp = _supabase.table("satellite_tiles").upsert(payload, on_conflict="tile_id,acquisition_date,collection").execute()
+            logger.info("Upsert response (ndvi exists): %s", getattr(resp, "_http_response", resp))
+            return True
+
         logger.info("↓ Downloading RED for %s %s", tile_id, acq_date)
         _download_asset(red_url, red_tmp.name)
         logger.info("↓ Downloading NIR for %s %s", tile_id, acq_date)
@@ -402,10 +438,10 @@ def _process_one(tile: Dict, cloud_cover: int, lookback_days: int, force: bool) 
         ndvi_size = _b2_upload(ndvi_tmp.name, ndvi_key)
 
         total_mb = None
-        if red_size and nir_size and ndvi_size:
+        if red_size is not None and nir_size is not None and ndvi_size is not None:
             total_mb = _safe_float((red_size + nir_size + ndvi_size) / (1024 * 1024), 2)
 
-        now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+        now_iso = datetime.datetime.datetime.utcnow().isoformat() + "Z"
         bbox = _extract_bbox(geom)
 
         payload = {
@@ -431,11 +467,8 @@ def _process_one(tile: Dict, cloud_cover: int, lookback_days: int, force: bool) 
         }
         payload.update(stats)
 
-        # Upsert by (tile_id, acquisition_date, collection)
-        _supabase.table("satellite_tiles").upsert(
-            payload,
-            on_conflict="tile_id,acquisition_date,collection",
-        ).execute()
+        resp = _supabase.table("satellite_tiles").upsert(payload, on_conflict="tile_id,acquisition_date,collection").execute()
+        logger.info("Upsert response: %s", getattr(resp, "_http_response", resp))
 
         logger.info("✅ Processed %s %s", tile_id, acq_date)
         return True
@@ -450,7 +483,7 @@ def _process_one(tile: Dict, cloud_cover: int, lookback_days: int, force: bool) 
                     "collection": MPC_COLLECTION.upper(),
                     "status": "failed",
                     "error_message": str(e),
-                    "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    "updated_at": datetime.datetime.datetime.utcnow().isoformat() + "Z",
                 },
                 on_conflict="tile_id,acquisition_date,collection",
             ).execute()
@@ -494,4 +527,3 @@ if __name__ == "__main__":
     cc = int(os.getenv("RUN_CLOUD_COVER", str(CLOUD_COVER_DEFAULT)))
     lb = int(os.getenv("RUN_LOOKBACK_DAYS", str(LOOKBACK_DAYS_DEFAULT)))
     main(cc, lb)
-
