@@ -77,14 +77,14 @@ async def run_worker(
             if cloud_cover is not None
             else body.get("cloud_cover")
             if body.get("cloud_cover") is not None
-            else int(os.getenv("DEFAULT_CLOUD_COVER_MAX", "80"))
+            else int(os.getenv("DEFAULT_CLOUD_COVER_MAX", "30"))
         )
         lb = (
             lookback_days
             if lookback_days is not None
             else body.get("lookback_days")
             if body.get("lookback_days") is not None
-            else int(os.getenv("MAX_SCENE_LOOKBACK_DAYS", "90"))
+            else int(os.getenv("MAX_SCENE_LOOKBACK_DAYS", "30"))
         )
         mt = (
             max_tiles
@@ -146,8 +146,8 @@ async def run_single_tile(tile_id: str, request: Request):
             body = await request.json()
         except Exception:
             body = {}
-        cc = int(body.get("cloud_cover", os.getenv("DEFAULT_CLOUD_COVER_MAX", 80)))
-        lb = int(body.get("lookback_days", os.getenv("MAX_SCENE_LOOKBACK_DAYS", 90)))
+        cc = int(body.get("cloud_cover", os.getenv("DEFAULT_CLOUD_COVER_MAX", 30)))
+        lb = int(body.get("lookback_days", os.getenv("MAX_SCENE_LOOKBACK_DAYS", 30)))
         force = bool(body.get("force", False))
 
         def background_job():
