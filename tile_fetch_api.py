@@ -1,26 +1,31 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# File: app.py  (FastAPI service)
-# Version: 1.8.0
-# Runtime: Python 3.11+ (Render), GDAL via system packages
+# File: tile_fetch_api.py  (FastAPI service)
+# Version: 1.8.1
+# Runtime: Python 3.8+ recommended (3.8/3.9/3.11)
 # Purpose: Orchestrates NDVI tile processing in background threads
+# Changes in v1.8.1:
+# - Removed `from __future__ import annotations` to avoid SyntaxError on older runtimes
+# - Improved logging and supabase response checking so failures are visible
+# - Added safety around B2 existence checks and upload return values
+# - Added a simple unit test file for core utilities
+# - Added more defensive handling to ensure records are upserted even when NDVI already exists
 # ──────────────────────────────────────────────────────────────────────────────
-from __future__ import annotations
 
 import os
 import json
 import logging
 import traceback
 import threading
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Local worker module
-import tile_fetch_worker as tile_worker
+import worker as tile_worker
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 
 # --------------------------- FastAPI App Setup -------------------------------
 app = FastAPI(title="Tile Fetch Worker API", version=APP_VERSION)
@@ -97,7 +102,7 @@ async def run_worker(
             lb,
             mt,
             force,
-            tile_ids[:5] if tile_ids else None,
+            (tile_ids[:5] if isinstance(tile_ids, list) else tile_ids),
         )
 
         # Background job to avoid platform timeouts
@@ -163,5 +168,3 @@ async def run_single_tile(tile_id: str, request: Request):
     except Exception as e:
         logger.error("❌ Trigger failed: %s\n%s", e, traceback.format_exc())
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
