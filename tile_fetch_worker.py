@@ -612,9 +612,7 @@ def process_tile(tile):
         if file_sizes["red"] and file_sizes["nir"] and file_sizes.get("ndvi"):
             total_size_mb = (file_sizes["red"] + file_sizes["nir"] + file_sizes["ndvi"]) / (1024 * 1024)
         
-       # Replace the payload creation section (around line 620-690) with this fixed version:
-
-        # Prepare DB payload with all relevant fields
+    # Prepare DB payload with all relevant fields
         now = datetime.datetime.utcnow().isoformat() + "Z"
         
         payload = {
@@ -740,4 +738,5 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
 
