@@ -22,6 +22,7 @@ import tempfile
 import logging
 import datetime
 from typing import Dict, List, Optional, Tuple
+from pystac_client import Client
 
 import numpy as np
 import requests
@@ -166,13 +167,16 @@ def _b2_upload(local_path: str, b2_name: str) -> Optional[int]:
 
 def _verify_tif(path: str) -> None:
     if not os.path.exists(path):
-        raise RuntimeError(f"missing tiff: {path}")
+        raise RuntimeError(f"missing file {path}")
     size = os.path.getsize(path)
     if size < 1024:
-        raise RuntimeError(f"invalid tiff (too small: {size} bytes): {path}")
-    with rasterio.Env():
+        raise RuntimeError(f"too small {size} bytes")
+    try:
         with rasterio.open(path) as src:
-            _ = src.count  # attempt to read metadata
+            _ = src.count
+    except Exception as e:
+        logger.error("❌ rasterio failed to open %s: %s", path, e)
+        raise
 
 
 # ----------------------- Supabase convenience --------------------------------
@@ -339,13 +343,14 @@ def _compute_ndvi_stream(red_path: str, nir_path: str, out_path: str) -> Dict:
 # --------------------------- Tile processing ---------------------------------
 
 def _download_asset(url: str, out_path: str) -> None:
-    with _session.get(url, stream=True, timeout=120) as r:
+    headers = {"Accept": "image/tiff, application/octet-stream"}
+    with _session.get(url, headers=headers, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(out_path, "wb") as f:
             for chunk in r.iter_content(1024 * 512):
-                if not chunk:
-                    continue
                 f.write(chunk)
+    logger.info("✅ Downloaded %s (%.2f MB)", out_path, os.path.getsize(out_path)/1024/1024)
+
 
 
 def _process_one(tile: Dict, cloud_cover: int, lookback_days: int, force: bool) -> bool:
@@ -527,3 +532,4 @@ if __name__ == "__main__":
     cc = int(os.getenv("RUN_CLOUD_COVER", str(CLOUD_COVER_DEFAULT)))
     lb = int(os.getenv("RUN_LOOKBACK_DAYS", str(LOOKBACK_DAYS_DEFAULT)))
     main(cc, lb)
+
