@@ -612,6 +612,8 @@ def process_tile(tile):
         if file_sizes["red"] and file_sizes["nir"] and file_sizes.get("ndvi"):
             total_size_mb = (file_sizes["red"] + file_sizes["nir"] + file_sizes["ndvi"]) / (1024 * 1024)
         
+       # Replace the payload creation section (around line 620-690) with this fixed version:
+
         # Prepare DB payload with all relevant fields
         now = datetime.datetime.utcnow().isoformat() + "Z"
         
@@ -627,14 +629,14 @@ def process_tile(tile):
             "nir_band_path": nir_b2,
             "ndvi_path": ndvi_b2,
             
-            # File sizes
+            # File sizes - convert to native int
             "file_size_mb": round(total_size_mb, 2) if total_size_mb else None,
-            "red_band_size_bytes": file_sizes.get("red"),
-            "nir_band_size_bytes": file_sizes.get("nir"),
-            "ndvi_size_bytes": file_sizes.get("ndvi"),
+            "red_band_size_bytes": int(file_sizes.get("red")) if file_sizes.get("red") else None,
+            "nir_band_size_bytes": int(file_sizes.get("nir")) if file_sizes.get("nir") else None,
+            "ndvi_size_bytes": int(file_sizes.get("ndvi")) if file_sizes.get("ndvi") else None,
             
             # Resolution
-            "resolution": "10m",  # Native Sentinel-2 red/nir resolution (downsampled if DOWNSAMPLE_FACTOR > 1)
+            "resolution": "10m",
             
             # Status and timestamps
             "status": "ready",
@@ -662,7 +664,7 @@ def process_tile(tile):
         elif original_created_at:
             payload["created_at"] = original_created_at
         
-        # Add NDVI statistics if available
+        # Add NDVI statistics if available - CONVERT ALL NUMPY TYPES TO PYTHON NATIVE TYPES
         if stats:
             payload.update({
                 "ndvi_min": str(stats.get("ndvi_min")) if stats.get("ndvi_min") is not None else None,
@@ -671,11 +673,11 @@ def process_tile(tile):
                 "ndvi_std_dev": str(stats.get("ndvi_std_dev")) if stats.get("ndvi_std_dev") is not None else None,
                 "vegetation_coverage_percent": str(stats.get("vegetation_coverage_percent")) if stats.get("vegetation_coverage_percent") is not None else None,
                 "data_completeness_percent": str(stats.get("data_completeness_percent")) if stats.get("data_completeness_percent") is not None else None,
-                "pixel_count": stats.get("pixel_count"),
-                "valid_pixel_count": stats.get("valid_pixel_count"),
+                # CRITICAL FIX: Convert numpy int64 to Python int
+                "pixel_count": int(stats.get("pixel_count")) if stats.get("pixel_count") is not None else None,
+                "valid_pixel_count": int(stats.get("valid_pixel_count")) if stats.get("valid_pixel_count") is not None else None,
                 "vegetation_health_score": str(stats.get("vegetation_health_score")) if stats.get("vegetation_health_score") is not None else None,
             })
-
         # Save to DB
         logging.info(f"💾 Saving record to database for {tile_id} {acq_date}")
         logging.info(f"📋 Payload has {len(payload)} fields")
@@ -738,3 +740,4 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
