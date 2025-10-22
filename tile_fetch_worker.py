@@ -28,7 +28,9 @@ from shapely.geometry import shape, mapping
 
 import planetary_computer as pc
 from supabase import create_client
-from b2sdk.v2 import InMemoryAccountInfo, B2Api, B2Error
+from b2sdk.v2 import InMemoryAccountInfo, B2Api
+from b2sdk.exception import B2Error
+
 from requests.adapters import HTTPAdapter, Retry
 
 # ------------------------------- CONFIG --------------------------------------
@@ -514,3 +516,4 @@ if __name__ == "__main__":
         _process_one(tiles[0], cc, lb, force=True)
     else:
         main(cc, lb)
+
