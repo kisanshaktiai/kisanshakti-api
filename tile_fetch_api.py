@@ -1,18 +1,18 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # File: tile_fetch_api.py  (FastAPI service)
-# Version: 1.8.1
+# Version: 1.8.2
 # Runtime: Python 3.8+ recommended (3.8/3.9/3.11)
 # Purpose: Orchestrates NDVI tile processing in background threads
-# Changes in v1.8.1:
-# - Removed `from __future__ import annotations` to avoid SyntaxError on older runtimes
-# - Improved logging and supabase response checking so failures are visible
-# - Added safety around B2 existence checks and upload return values
-# - Added a simple unit test file for core utilities
-# - Added more defensive handling to ensure records are upserted even when NDVI already exists
+# Updates in v1.8.2:
+# - Added root route ("/") to prevent 404 "No server available" errors
+# - Enhanced /health endpoint with uptime and app info
+# - Improved structured logging at startup
+# - Minor response consistency improvements
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os
 import json
+import time
 import logging
 import traceback
 import threading
@@ -25,7 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 # Local worker module
 import tile_fetch_worker as tile_worker
 
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
+START_TIME = time.time()
 
 # --------------------------- FastAPI App Setup -------------------------------
 app = FastAPI(title="Tile Fetch Worker API", version=APP_VERSION)
@@ -37,16 +38,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logger = logging.getLogger("worker_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("worker_api")
+logger.info(f"🚀 Starting Tile Fetch Worker API v{APP_VERSION}")
 
 
+# ------------------------------ Root Route -----------------------------------
+@app.get("/")
+def root():
+    """Root endpoint to confirm API is running."""
+    uptime = round(time.time() - START_TIME, 2)
+    return {
+        "status": "running",
+        "version": APP_VERSION,
+        "uptime_sec": uptime,
+        "message": "Tile Fetch Worker API is active and ready.",
+        "endpoints": ["/health", "/run", "/run/{tile_id}"],
+    }
+
+
+# ------------------------------ Health Check ---------------------------------
 @app.get("/health")
 def health_check():
     """Simple health check for uptime monitoring."""
-    return {"status": "ok", "version": APP_VERSION}
+    uptime = round(time.time() - START_TIME, 2)
+    return {"status": "ok", "version": APP_VERSION, "uptime_sec": uptime}
 
 
+# --------------------------- NDVI Worker Trigger -----------------------------
 @app.post("/run")
 async def run_worker(
     request: Request,
@@ -54,44 +73,28 @@ async def run_worker(
     lookback_days: Optional[int] = Query(default=None, ge=1, le=365),
     max_tiles: Optional[int] = Query(default=None, ge=1, le=10000),
 ):
-    """Kick off the NDVI worker in a background thread.
-
-    Query params override JSON body if provided.
-    Body schema (all optional): {
-      "cloud_cover": 30,
-      "lookback_days": 5,
-      "tile_ids": ["43QEG", "43QFG"],
-      "max_tiles": 100,
-      "force": false
-    }
-    """
+    """Kick off the NDVI worker in a background thread."""
     try:
+        body = {}
         try:
             body = await request.json()
         except Exception:
-            body = {}
+            pass
 
-        # Resolve parameters with precedence: query > body > env > defaults
         cc = (
             cloud_cover
             if cloud_cover is not None
-            else body.get("cloud_cover")
-            if body.get("cloud_cover") is not None
-            else int(os.getenv("DEFAULT_CLOUD_COVER_MAX", "30"))
+            else body.get("cloud_cover", int(os.getenv("DEFAULT_CLOUD_COVER_MAX", "30")))
         )
         lb = (
             lookback_days
             if lookback_days is not None
-            else body.get("lookback_days")
-            if body.get("lookback_days") is not None
-            else int(os.getenv("MAX_SCENE_LOOKBACK_DAYS", "30"))
+            else body.get("lookback_days", int(os.getenv("MAX_SCENE_LOOKBACK_DAYS", "30")))
         )
         mt = (
             max_tiles
             if max_tiles is not None
             else body.get("max_tiles")
-            if body.get("max_tiles") is not None
-            else None
         )
         tile_ids = body.get("tile_ids") or None
         force = bool(body.get("force", False))
@@ -105,7 +108,6 @@ async def run_worker(
             (tile_ids[:5] if isinstance(tile_ids, list) else tile_ids),
         )
 
-        # Background job to avoid platform timeouts
         def background_job():
             try:
                 stats = tile_worker.main(
@@ -119,17 +121,23 @@ async def run_worker(
             except Exception:
                 logger.error("❌ Background worker crashed: %s", traceback.format_exc())
 
-        thread = threading.Thread(target=background_job, daemon=True)
-        thread.start()
+        threading.Thread(target=background_job, daemon=True).start()
 
         return JSONResponse(
             status_code=200,
             content={
                 "status": "started",
                 "message": "Worker started in background.",
-                "params": {"cloud_cover": cc, "lookback_days": lb, "max_tiles": mt, "force": force},
+                "params": {
+                    "cloud_cover": cc,
+                    "lookback_days": lb,
+                    "max_tiles": mt,
+                    "force": force,
+                    "tile_ids": tile_ids,
+                },
             },
         )
+
     except Exception as e:
         logger.error("❌ Trigger failed: %s\n%s", e, traceback.format_exc())
         return JSONResponse(
@@ -138,6 +146,7 @@ async def run_worker(
         )
 
 
+# --------------------------- Single Tile Trigger -----------------------------
 @app.post("/run/{tile_id}")
 async def run_single_tile(tile_id: str, request: Request):
     """Process a single MGRS tile id on-demand."""
@@ -146,6 +155,7 @@ async def run_single_tile(tile_id: str, request: Request):
             body = await request.json()
         except Exception:
             body = {}
+
         cc = int(body.get("cloud_cover", os.getenv("DEFAULT_CLOUD_COVER_MAX", 30)))
         lb = int(body.get("lookback_days", os.getenv("MAX_SCENE_LOOKBACK_DAYS", 30)))
         force = bool(body.get("force", False))
@@ -164,7 +174,17 @@ async def run_single_tile(tile_id: str, request: Request):
                 logger.error("❌ Single-tile run crashed: %s", traceback.format_exc())
 
         threading.Thread(target=background_job, daemon=True).start()
-        return {"status": "started", "tile_id": tile_id, "cloud_cover": cc, "lookback_days": lb}
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "started",
+                "tile_id": tile_id,
+                "cloud_cover": cc,
+                "lookback_days": lb,
+                "force": force,
+            },
+        )
+
     except Exception as e:
         logger.error("❌ Trigger failed: %s\n%s", e, traceback.format_exc())
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
