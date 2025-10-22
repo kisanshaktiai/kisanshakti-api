@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Local worker module
-import worker as tile_worker
+import tile_fetch_worker as tile_worker
 
 APP_VERSION = "1.8.0"
 
