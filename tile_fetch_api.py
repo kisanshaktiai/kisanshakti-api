@@ -1,19 +1,29 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+# ──────────────────────────────────────────────────────────────────────────────
+# File: app.py  (FastAPI service)
+# Version: 1.8.0
+# Runtime: Python 3.11+ (Render), GDAL via system packages
+# Purpose: Orchestrates NDVI tile processing in background threads
+# ──────────────────────────────────────────────────────────────────────────────
+from __future__ import annotations
+
+import os
+import json
 import logging
 import traceback
 import threading
+from typing import List, Optional
 
-# Import your main NDVI worker script
-import tile_fetch_worker as tile_fetch_worker
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# ------------------------------------------------------
-# ✅ FastAPI App Setup
-# ------------------------------------------------------
-app = FastAPI(title="Tile Fetch Worker API", version="1.7.1")
+# Local worker module
+import worker as tile_worker
 
-# Enable CORS (wide open — you can restrict origins later)
+APP_VERSION = "1.8.0"
+
+# --------------------------- FastAPI App Setup -------------------------------
+app = FastAPI(title="Tile Fetch Worker API", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,68 +32,136 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("worker_api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ------------------------------------------------------
-# ✅ Health Endpoint (for Render monitoring)
-# ------------------------------------------------------
+
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    """Simple health check for uptime monitoring."""
+    return {"status": "ok", "version": APP_VERSION}
 
 
-# ------------------------------------------------------
-# ✅ Main Worker Endpoint (POST /run)
-#    Runs NDVI worker — async background by default
-# ------------------------------------------------------
 @app.post("/run")
-async def run_worker(request: Request):
-    """
-    Trigger NDVI tile processing.
-    The worker runs in a background thread to avoid 300s timeout issues
-    on Supabase Edge Functions.
+async def run_worker(
+    request: Request,
+    cloud_cover: Optional[int] = Query(default=None, ge=0, le=100),
+    lookback_days: Optional[int] = Query(default=None, ge=1, le=365),
+    max_tiles: Optional[int] = Query(default=None, ge=1, le=10000),
+):
+    """Kick off the NDVI worker in a background thread.
+
+    Query params override JSON body if provided.
+    Body schema (all optional): {
+      "cloud_cover": 30,
+      "lookback_days": 5,
+      "tile_ids": ["43QEG", "43QFG"],
+      "max_tiles": 100,
+      "force": false
+    }
     """
     try:
-        body = await request.json()
-        cloud_cover = int(body.get("cloud_cover", 30))
-        lookback_days = int(body.get("lookback_days", 5))
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
 
-        logger.info(f"🛰️ Starting worker: cloud_cover={cloud_cover}, lookback_days={lookback_days}")
+        # Resolve parameters with precedence: query > body > env > defaults
+        cc = (
+            cloud_cover
+            if cloud_cover is not None
+            else body.get("cloud_cover")
+            if body.get("cloud_cover") is not None
+            else int(os.getenv("DEFAULT_CLOUD_COVER_MAX", "80"))
+        )
+        lb = (
+            lookback_days
+            if lookback_days is not None
+            else body.get("lookback_days")
+            if body.get("lookback_days") is not None
+            else int(os.getenv("MAX_SCENE_LOOKBACK_DAYS", "90"))
+        )
+        mt = (
+            max_tiles
+            if max_tiles is not None
+            else body.get("max_tiles")
+            if body.get("max_tiles") is not None
+            else None
+        )
+        tile_ids = body.get("tile_ids") or None
+        force = bool(body.get("force", False))
 
-        # ---- Run background thread so Edge Function doesn't timeout ----
+        logger.info(
+            "🛰️ Starting worker: cloud_cover=%s, lookback_days=%s, max_tiles=%s, force=%s, tiles=%s",
+            cc,
+            lb,
+            mt,
+            force,
+            tile_ids[:5] if tile_ids else None,
+        )
+
+        # Background job to avoid platform timeouts
         def background_job():
             try:
-                processed = tile_fetch_worker.main(
-                    cloud_cover=cloud_cover,
-                    lookback_days=lookback_days
+                stats = tile_worker.main(
+                    cloud_cover=cc,
+                    lookback_days=lb,
+                    filter_tile_ids=tile_ids,
+                    max_tiles=mt,
+                    force=force,
                 )
-                logger.info(f"✅ Worker completed successfully: {processed} tiles processed")
-            except Exception as e:
-                logger.error(f"❌ Background worker failed: {e}\n{traceback.format_exc()}")
+                logger.info("✅ Worker finished: %s", json.dumps(stats))
+            except Exception:
+                logger.error("❌ Background worker crashed: %s", traceback.format_exc())
 
         thread = threading.Thread(target=background_job, daemon=True)
         thread.start()
 
-        # Return immediately so Supabase Edge Function doesn’t hit timeout
         return JSONResponse(
             status_code=200,
             content={
                 "status": "started",
-                "message": "Worker started successfully in background.",
-                "cloud_cover": cloud_cover,
-                "lookback_days": lookback_days,
+                "message": "Worker started in background.",
+                "params": {"cloud_cover": cc, "lookback_days": lb, "max_tiles": mt, "force": force},
             },
         )
-
     except Exception as e:
-        logger.error(f"❌ Worker trigger failed: {e}\n{traceback.format_exc()}")
+        logger.error("❌ Trigger failed: %s\n%s", e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
-            content={
-                "status": "error",
-                "message": str(e),
-                "details": traceback.format_exc(),
-            },
+            content={"status": "error", "message": str(e)},
         )
+
+
+@app.post("/run/{tile_id}")
+async def run_single_tile(tile_id: str, request: Request):
+    """Process a single MGRS tile id on-demand."""
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        cc = int(body.get("cloud_cover", os.getenv("DEFAULT_CLOUD_COVER_MAX", 80)))
+        lb = int(body.get("lookback_days", os.getenv("MAX_SCENE_LOOKBACK_DAYS", 90)))
+        force = bool(body.get("force", False))
+
+        def background_job():
+            try:
+                stats = tile_worker.main(
+                    cloud_cover=cc,
+                    lookback_days=lb,
+                    filter_tile_ids=[tile_id],
+                    max_tiles=1,
+                    force=force,
+                )
+                logger.info("✅ Single-tile run finished: %s", json.dumps(stats))
+            except Exception:
+                logger.error("❌ Single-tile run crashed: %s", traceback.format_exc())
+
+        threading.Thread(target=background_job, daemon=True).start()
+        return {"status": "started", "tile_id": tile_id, "cloud_cover": cc, "lookback_days": lb}
+    except Exception as e:
+        logger.error("❌ Trigger failed: %s\n%s", e, traceback.format_exc())
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
