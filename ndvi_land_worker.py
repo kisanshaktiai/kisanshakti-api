@@ -1,14 +1,12 @@
 """
-NDVI Land Worker (v4.2.1-FIXED)
---------------------------------
-🌿 KisanShaktiAI NDVI Processor - Fixed Date Detection
+NDVI Land Worker (v4.3.0-FIXED-B2-PATHS)
+----------------------------------------
+🌿 KisanShaktiAI NDVI Processor - Fixed B2 URL Resolution
 
-✅ FIX: Now queries satellite_tiles table for actual acquisition_date
-✅ Auto-detects latest tile date from database (not hardcoded)
-✅ Reads raw B04/B08 bands or precomputed ndvi.tif
-✅ Updates ndvi_data + ndvi_micro_tiles tables
-✅ Uploads vegetation PNG to Supabase (ndvi-thumbnails)
-✅ Logs to ndvi_processing_logs
+✅ FIX: Now uses actual B2 paths from satellite_tiles table
+✅ Converts b2:// protocol paths to HTTP URLs
+✅ Validates file existence before processing
+✅ Better error messages showing actual URLs tried
 
 © 2025 KisanShaktiAI | Fixed by Claude
 """
@@ -38,7 +36,7 @@ if not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("ndvi-worker-v4.2.1")
+logger = logging.getLogger("ndvi-worker-v4.3.0")
 
 # ============================================================
 # NDVI UTILITIES
@@ -80,44 +78,69 @@ def upload_thumbnail_to_supabase(path: str, png_bytes: bytes) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_NDVI_BUCKET}/{path}"
 
 # ============================================================
-# B2 HELPERS
+# B2 PATH CONVERSION
 # ============================================================
-def build_b2_url(subdir: str, tile_id: str, date: str, filename: str) -> str:
-    """Return full accessible B2 URL."""
-    return f"{B2_REGION_URL}/{B2_BUCKET}/tiles/{subdir}/{tile_id}/{date}/{filename}"
+def convert_b2_path_to_url(b2_path: str) -> str:
+    """
+    Convert b2:// protocol path to HTTP URL
+    
+    Input: b2://kisanshakti-ndvi-tiles/tiles/raw/43QCU/2025-10-05/B04.tif
+    Output: https://f005.backblazeb2.com/file/kisanshakti-ndvi-tiles/tiles/raw/43QCU/2025-10-05/B04.tif
+    """
+    if b2_path.startswith("b2://"):
+        # Remove b2:// prefix and prepend HTTP base URL
+        path = b2_path.replace("b2://", "")
+        return f"{B2_REGION_URL}/{path}"
+    elif b2_path.startswith("http"):
+        # Already an HTTP URL
+        return b2_path
+    else:
+        # Assume it's a relative path
+        return f"{B2_REGION_URL}/{B2_BUCKET}/{b2_path}"
 
 def check_b2_file_exists(url: str) -> bool:
+    """Check if file exists and is accessible at B2 URL"""
     try:
         resp = requests.head(url, timeout=30)
-        return resp.status_code == 200
-    except Exception:
+        exists = resp.status_code == 200
+        if not exists:
+            logger.warning(f"⚠️ B2 file check failed (status {resp.status_code}): {url}")
+        return exists
+    except Exception as e:
+        logger.warning(f"⚠️ B2 file check error: {e}")
         return False
 
-def get_latest_available_date(tile_id: str) -> str:
+# ============================================================
+# TILE DATA RETRIEVAL
+# ============================================================
+def get_tile_data_for_date(tile_id: str, date: str = None) -> dict:
     """
-    🔥 FIXED: Query satellite_tiles table for actual acquisition_date
-    Returns the most recent available date for the given tile_id
+    Get tile data from satellite_tiles table with actual B2 paths.
+    If date is None, gets the latest available tile.
     """
     try:
-        # Query database for this tile's acquisition dates
-        resp = supabase.table("satellite_tiles") \
-            .select("acquisition_date") \
+        query = supabase.table("satellite_tiles") \
+            .select("*") \
             .eq("tile_id", tile_id) \
-            .eq("status", "ready") \
-            .order("acquisition_date", desc=True) \
-            .limit(1) \
-            .execute()
+            .eq("status", "ready")
+        
+        if date:
+            query = query.eq("acquisition_date", date)
+        else:
+            query = query.order("acquisition_date", desc=True).limit(1)
+        
+        resp = query.execute()
         
         if resp.data and len(resp.data) > 0:
-            date = resp.data[0]["acquisition_date"]
-            logger.info(f"✅ Found tile date from database: {tile_id} -> {date}")
-            return date
+            tile_data = resp.data[0]
+            logger.info(f"✅ Found tile metadata for {tile_id} on {tile_data['acquisition_date']}")
+            return tile_data
         else:
-            logger.warning(f"⚠️ No ready tiles found for {tile_id} in database")
+            logger.error(f"❌ No tile data found for {tile_id}" + (f" on {date}" if date else ""))
             return None
             
     except Exception as e:
-        logger.error(f"❌ Error querying tile date: {e}")
+        logger.error(f"❌ Error querying tile data: {e}")
         return None
 
 # ============================================================
@@ -155,38 +178,56 @@ def process_farmer_land(land: dict, tile: dict = None) -> bool:
             raise ValueError("No intersecting satellite tile found.")
         tile_id = tile["tile_id"]
 
-        # 🔥 FIX: Get actual date from database
-        date = get_latest_available_date(tile_id)
-        if not date:
-            raise ValueError(f"No ready satellite data found for tile {tile_id}")
-            
+        # 🔥 FIX: Get tile data with actual B2 paths from database
+        tile_data = get_tile_data_for_date(tile_id)
+        if not tile_data:
+            raise ValueError(f"No satellite data found for tile {tile_id}")
+        
+        date = tile_data["acquisition_date"]
         logger.info(f"🛰️ Processing tile {tile_id} for date {date}")
 
-        # Try raw bands first
-        b04_url = build_b2_url("raw", tile_id, date, "B04.tif")
-        b08_url = build_b2_url("raw", tile_id, date, "B08.tif")
-        ndvi_url = build_b2_url("ndvi", tile_id, date, "ndvi.tif")
+        # Convert B2 paths to HTTP URLs
+        b04_url = convert_b2_path_to_url(tile_data.get("red_band_path", ""))
+        b08_url = convert_b2_path_to_url(tile_data.get("nir_band_path", ""))
+        ndvi_url = convert_b2_path_to_url(tile_data.get("ndvi_path", ""))
 
         # Log URLs being tried
-        logger.info(f"🔍 Checking B04: {b04_url}")
-        logger.info(f"🔍 Checking B08: {b08_url}")
-        logger.info(f"🔍 Checking NDVI: {ndvi_url}")
+        logger.info(f"🔍 Red band URL: {b04_url}")
+        logger.info(f"🔍 NIR band URL: {b08_url}")
+        logger.info(f"🔍 NDVI URL: {ndvi_url}")
 
-        if check_b2_file_exists(b04_url) and check_b2_file_exists(b08_url):
+        # Check which files exist
+        b04_exists = check_b2_file_exists(b04_url)
+        b08_exists = check_b2_file_exists(b08_url)
+        ndvi_exists = check_b2_file_exists(ndvi_url)
+
+        logger.info(f"📊 File availability: B04={b04_exists}, B08={b08_exists}, NDVI={ndvi_exists}")
+
+        if b04_exists and b08_exists:
             logger.info("✅ Found raw bands, computing NDVI")
             with rasterio.open(b04_url) as red, rasterio.open(b08_url) as nir:
                 geom_t = transform_geom("EPSG:4326", red.crs.to_string(), mapping(land_geom))
                 arr_r, _ = mask(red, [geom_t], crop=True, all_touched=True, nodata=np.nan)
                 arr_n, _ = mask(nir, [geom_t], crop=True, all_touched=True, nodata=np.nan)
                 ndvi = calculate_ndvi(arr_r[0], arr_n[0])
-        elif check_b2_file_exists(ndvi_url):
+        elif ndvi_exists:
             logger.info("🟢 Using precomputed NDVI file")
             with rasterio.open(ndvi_url) as src:
                 geom_t = transform_geom("EPSG:4326", src.crs.to_string(), mapping(land_geom))
                 arr, _ = mask(src, [geom_t], crop=True, all_touched=True, nodata=np.nan)
                 ndvi = arr[0]
         else:
-            raise FileNotFoundError(f"No valid NDVI or raw bands found for {tile_id}/{date}")
+            # Provide detailed error message
+            error_details = []
+            if not b04_exists:
+                error_details.append(f"B04 not found: {b04_url}")
+            if not b08_exists:
+                error_details.append(f"B08 not found: {b08_url}")
+            if not ndvi_exists:
+                error_details.append(f"NDVI not found: {ndvi_url}")
+            
+            error_msg = "No valid NDVI or raw bands accessible. " + " | ".join(error_details)
+            raise FileNotFoundError(error_msg)
 
         # Compute stats and save image
         stats = calculate_statistics(ndvi)
@@ -221,7 +262,7 @@ def process_farmer_land(land: dict, tile: dict = None) -> bool:
             "tenant_id": tenant_id,
             "land_id": land_id,
             "acquisition_date": date,
-            "cloud_cover": 0,
+            "cloud_cover": tile_data.get("cloud_cover", 0),
             "ndvi_mean": stats["mean"],
             "ndvi_min": stats["min"],
             "ndvi_max": stats["max"],
@@ -294,7 +335,7 @@ def process_queue(limit=10, max_workers=4):
 def main():
     limit = int(os.getenv("NDVI_WORKER_LIMIT", 10))
     workers = int(os.getenv("NDVI_WORKER_THREADS", 4))
-    logger.info(f"🚀 NDVI Worker v4.2.1 starting | limit={limit}, threads={workers}")
+    logger.info(f"🚀 NDVI Worker v4.3.0 starting | limit={limit}, threads={workers}")
     process_queue(limit=limit, max_workers=workers)
     logger.info("🏁 NDVI Worker finished")
 
