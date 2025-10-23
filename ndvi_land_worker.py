@@ -1,15 +1,14 @@
 """
-NDVI Land Worker (v4.3.1-PRODUCTION)
-------------------------------------
-🌿 KisanShaktiAI NDVI Processor - Private B2 Bucket Compatible
-
-✅ Fix: Uses authorized B2 API download URLs
-✅ Automatically authenticates and downloads B04/B08/NDVI.tif securely
-✅ Works with both raw and precomputed NDVI files
-✅ Uploads vegetation PNG to Supabase
+NDVI Land Worker v4.3.2 — KisanShaktiAI Production
+---------------------------------------------------
+✅ Uses existing env structure (B2_APP_KEY_ID / B2_APP_KEY)
+✅ Caches B2 authorization for faster NDVI processing
+✅ Works with private B2 buckets
+✅ Generates vegetation map PNGs
+✅ Saves stats + thumbnails to Supabase
 """
 
-import os, io, json, datetime, logging, traceback, base64
+import os, io, json, datetime, logging, traceback, functools
 import numpy as np, requests, rasterio
 from rasterio.mask import mask
 from rasterio.warp import transform_geom
@@ -18,54 +17,61 @@ from PIL import Image
 import matplotlib.cm as cm
 from supabase import create_client
 
-# ------------------------------------------------------
-# CONFIGURATION
-# ------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://qfklkkzxemsbeniyugiz.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-SUPABASE_NDVI_BUCKET = os.getenv("SUPABASE_NDVI_BUCKET", "ndvi-thumbnails")
+# ---------------- Config ----------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-B2_KEY_ID = os.getenv("B2_KEY_ID")
-B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY")
-B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME", "kisanshakti-ndvi-tiles")
+B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")
+B2_APP_KEY = os.environ.get("B2_APP_KEY")
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET_RAW", "kisanshakti-ndvi-tiles")
+B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")
 
-if not (SUPABASE_KEY and B2_KEY_ID and B2_APPLICATION_KEY):
+MPC_STAC = os.environ.get("MPC_STAC_BASE", "https://planetarycomputer.microsoft.com/api/stac/v1/search")
+MPC_COLLECTION = os.environ.get("MPC_COLLECTION", "sentinel-2-l2a")
+CLOUD_COVER = int(os.environ.get("DEFAULT_CLOUD_COVER_MAX", "20"))
+LOOKBACK_DAYS = int(os.environ.get("MAX_SCENE_LOOKBACK_DAYS", "5"))
+DOWNSAMPLE_FACTOR = int(os.environ.get("DOWNSAMPLE_FACTOR", "4"))
+
+SUPABASE_NDVI_BUCKET = os.environ.get("SUPABASE_NDVI_BUCKET", "ndvi-thumbnails")
+
+if not (SUPABASE_KEY and B2_APP_KEY_ID and B2_APP_KEY):
     raise ValueError("❌ Missing Supabase or B2 credentials!")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("ndvi-worker-v4.3.1")
+logger = logging.getLogger("ndvi-worker-v4.3.2")
 
 # ------------------------------------------------------
-# B2 AUTH + DOWNLOAD
+# Backblaze B2 Authorization + File Download
 # ------------------------------------------------------
-def b2_authorize():
-    logger.info("🔑 Authorizing Backblaze B2 account...")
+@functools.lru_cache(maxsize=1)
+def b2_authorize_cached():
+    """Authorize Backblaze B2 account and cache token."""
+    logger.info("🔑 Authorizing Backblaze B2 account (cached)...")
     url = "https://api.backblazeb2.com/b2api/v2/b2_authorize_account"
-    auth = requests.auth.HTTPBasicAuth(B2_KEY_ID, B2_APPLICATION_KEY)
+    auth = requests.auth.HTTPBasicAuth(B2_APP_KEY_ID, B2_APP_KEY)
     res = requests.get(url, auth=auth)
     res.raise_for_status()
     data = res.json()
-    logger.info("✅ B2 authorization success")
+    logger.info("✅ B2 authorization success (token cached)")
     return {
         "auth_token": data["authorizationToken"],
         "download_url": data["downloadUrl"],
-        "api_url": data["apiUrl"],
     }
 
-def b2_download_file(file_path: str, auth_data: dict) -> bytes:
-    """Downloads file securely from B2 using authorization token."""
+def b2_download_file(file_path: str) -> io.BytesIO:
+    """Download file from private B2 bucket."""
+    auth_data = b2_authorize_cached()
     url = f"{auth_data['download_url']}/file/{B2_BUCKET_NAME}/{file_path}"
     headers = {"Authorization": auth_data["auth_token"]}
     res = requests.get(url, headers=headers, timeout=120)
     if res.status_code == 200:
         return io.BytesIO(res.content)
-    else:
-        raise FileNotFoundError(f"❌ Failed to fetch {file_path} ({res.status_code})")
+    raise FileNotFoundError(f"⚠️ B2 file missing or unauthorized: {file_path} ({res.status_code})")
 
 # ------------------------------------------------------
-# NDVI PROCESSING UTILITIES
+# NDVI Utilities
 # ------------------------------------------------------
 def calculate_ndvi(red, nir):
     np.seterr(divide="ignore", invalid="ignore")
@@ -82,12 +88,6 @@ def create_colorized_ndvi_png(ndvi, cmap="RdYlGn") -> bytes:
     buf.seek(0)
     return buf.getvalue()
 
-def upload_thumbnail_to_supabase(path: str, png_bytes: bytes) -> str:
-    supabase.storage.from_(SUPABASE_NDVI_BUCKET).upload(
-        path, io.BytesIO(png_bytes), {"content-type": "image/png", "upsert": True}
-    )
-    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_NDVI_BUCKET}/{path}"
-
 def calculate_statistics(arr):
     valid = arr[~np.isnan(arr)]
     total = arr.size
@@ -103,8 +103,14 @@ def calculate_statistics(arr):
         "coverage": float(valid.size / total * 100),
     }
 
+def upload_thumbnail_to_supabase(path: str, png_bytes: bytes) -> str:
+    supabase.storage.from_(SUPABASE_NDVI_BUCKET).upload(
+        path, io.BytesIO(png_bytes), {"content-type": "image/png", "upsert": True}
+    )
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_NDVI_BUCKET}/{path}"
+
 # ------------------------------------------------------
-# MAIN PROCESSOR
+# Main Land Processor
 # ------------------------------------------------------
 def process_farmer_land(land, tile):
     land_id = land["id"]
@@ -113,35 +119,29 @@ def process_farmer_land(land, tile):
         geom_raw = land.get("boundary_polygon_old") or land.get("boundary_polygon")
         if not geom_raw:
             raise ValueError("Missing boundary polygon")
-        land_geom = shape(geom_raw if isinstance(geom_raw, dict) else json.loads(geom_raw))
 
-        # Fetch tile metadata
+        land_geom = shape(geom_raw if isinstance(geom_raw, dict) else json.loads(geom_raw))
         tile_id = tile["tile_id"]
         date = tile["acquisition_date"]
 
-        b04_path = tile.get("red_band_path") or f"tiles/raw/{tile_id}/{date}/B04.tif"
-        b08_path = tile.get("nir_band_path") or f"tiles/raw/{tile_id}/{date}/B08.tif"
-        ndvi_path = tile.get("ndvi_path") or f"tiles/ndvi/{tile_id}/{date}/ndvi.tif"
+        b04_path = f"{B2_PREFIX}raw/{tile_id}/{date}/B04.tif"
+        b08_path = f"{B2_PREFIX}raw/{tile_id}/{date}/B08.tif"
+        ndvi_path = f"{B2_PREFIX}ndvi/{tile_id}/{date}/ndvi.tif"
 
-        logger.info(f"🛰️ Tile {tile_id} | Date {date}")
-        logger.info(f"B04: {b04_path}")
-        logger.info(f"B08: {b08_path}")
-        logger.info(f"NDVI: {ndvi_path}")
+        logger.info(f"🛰️ Processing tile {tile_id} for land {land_id} ({date})")
 
-        auth_data = b2_authorize()
-
-        # Try NDVI first
+        # Try precomputed NDVI first
         try:
-            ndvi_buf = b2_download_file(ndvi_path, auth_data)
-            logger.info("🟢 Using precomputed NDVI file")
+            ndvi_buf = b2_download_file(ndvi_path)
+            logger.info("🟢 Using precomputed NDVI.tif")
             with rasterio.open(ndvi_buf) as src:
                 geom_t = transform_geom("EPSG:4326", src.crs.to_string(), mapping(land_geom))
                 arr, _ = mask(src, [geom_t], crop=True, all_touched=True, nodata=np.nan)
                 ndvi = arr[0]
-        except Exception:
-            logger.info("⚠️ Precomputed NDVI not found, computing from raw bands")
-            red_buf = b2_download_file(b04_path, auth_data)
-            nir_buf = b2_download_file(b08_path, auth_data)
+        except Exception as e:
+            logger.warning(f"⚠️ NDVI.tif missing, computing manually: {e}")
+            red_buf = b2_download_file(b04_path)
+            nir_buf = b2_download_file(b08_path)
             with rasterio.open(red_buf) as red, rasterio.open(nir_buf) as nir:
                 geom_t = transform_geom("EPSG:4326", red.crs.to_string(), mapping(land_geom))
                 arr_r, _ = mask(red, [geom_t], crop=True, all_touched=True, nodata=np.nan)
@@ -157,7 +157,7 @@ def process_farmer_land(land, tile):
         image_url = upload_thumbnail_to_supabase(path, png_bytes)
         now = datetime.datetime.utcnow().isoformat()
 
-        # Save results
+        # Update ndvi_data
         supabase.table("ndvi_data").upsert({
             "tenant_id": tenant_id,
             "land_id": land_id,
@@ -171,16 +171,21 @@ def process_farmer_land(land, tile):
             "updated_at": now
         }, on_conflict="land_id,date").execute()
 
-        supabase.table("micro_tile_thumbnail").upsert({
+        # Update ndvi_micro_tiles
+        supabase.table("ndvi_micro_tiles").upsert({
             "tenant_id": tenant_id,
             "land_id": land_id,
             "acquisition_date": date,
             "ndvi_thumbnail_url": image_url,
             "bbox": mapping(land_geom),
+            "ndvi_mean": stats["mean"],
+            "ndvi_min": stats["min"],
+            "ndvi_max": stats["max"],
+            "ndvi_std_dev": stats["std"],
             "created_at": now
         }, on_conflict="land_id,acquisition_date").execute()
 
-        logger.info(f"✅ Land {land_id} NDVI success (mean={stats['mean']:.3f})")
+        logger.info(f"✅ Land {land_id} NDVI processed successfully (mean={stats['mean']:.3f})")
         return True
 
     except Exception as e:
