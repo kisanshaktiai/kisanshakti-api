@@ -218,3 +218,6 @@ def process_land_ndvi_thumbnail(land, tile):
             "error_details": {"traceback": traceback.format_exc()[:1000]},
         }).execute()
         return False
+        # ---------------- Compatibility Alias ----------------
+process_farmer_land = process_land_ndvi_thumbnail
+
