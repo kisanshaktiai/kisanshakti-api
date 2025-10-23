@@ -1,17 +1,16 @@
 """
-NDVI Land Worker (v4.2.0-PRODUCTION)
-------------------------------------
-🌿 KisanShaktiAI NDVI Processor - Auto-date, Band & NDVI.tif Integration
+NDVI Land Worker (v4.2.1-FIXED)
+--------------------------------
+🌿 KisanShaktiAI NDVI Processor - Fixed Date Detection
 
-✅ Auto-detects latest tile date (from B2)
+✅ FIX: Now queries satellite_tiles table for actual acquisition_date
+✅ Auto-detects latest tile date from database (not hardcoded)
 ✅ Reads raw B04/B08 bands or precomputed ndvi.tif
-✅ Uses correct B2 URL paths for your setup
 ✅ Updates ndvi_data + ndvi_micro_tiles tables
 ✅ Uploads vegetation PNG to Supabase (ndvi-thumbnails)
 ✅ Logs to ndvi_processing_logs
-✅ Fully schema-aligned and tested
 
-© 2025 KisanShaktiAI | Engineered by Amarsinh Patil
+© 2025 KisanShaktiAI | Fixed by Claude
 """
 
 import io, os, json, base64, datetime, logging, traceback
@@ -39,7 +38,7 @@ if not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("ndvi-worker-v4.2.0")
+logger = logging.getLogger("ndvi-worker-v4.2.1")
 
 # ============================================================
 # NDVI UTILITIES
@@ -95,15 +94,31 @@ def check_b2_file_exists(url: str) -> bool:
         return False
 
 def get_latest_available_date(tile_id: str) -> str:
-    """Static fallback: prefer known tile date first, fallback to today."""
-    # ideally you would query B2 API to list available folders
-    preferred_dates = ["2025-10-05", "2025-10-10", "2025-10-15"]
-    for d in preferred_dates:
-        url = build_b2_url("raw", tile_id, d, "B04.tif")
-        if check_b2_file_exists(url):
-            logger.info(f"📅 Using available tile date: {d}")
-            return d
-    return datetime.date.today().isoformat()
+    """
+    🔥 FIXED: Query satellite_tiles table for actual acquisition_date
+    Returns the most recent available date for the given tile_id
+    """
+    try:
+        # Query database for this tile's acquisition dates
+        resp = supabase.table("satellite_tiles") \
+            .select("acquisition_date") \
+            .eq("tile_id", tile_id) \
+            .eq("status", "ready") \
+            .order("acquisition_date", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        if resp.data and len(resp.data) > 0:
+            date = resp.data[0]["acquisition_date"]
+            logger.info(f"✅ Found tile date from database: {tile_id} -> {date}")
+            return date
+        else:
+            logger.warning(f"⚠️ No ready tiles found for {tile_id} in database")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Error querying tile date: {e}")
+        return None
 
 # ============================================================
 # TILE DETECTION
@@ -140,14 +155,22 @@ def process_farmer_land(land: dict, tile: dict = None) -> bool:
             raise ValueError("No intersecting satellite tile found.")
         tile_id = tile["tile_id"]
 
-        # detect latest date from B2
+        # 🔥 FIX: Get actual date from database
         date = get_latest_available_date(tile_id)
+        if not date:
+            raise ValueError(f"No ready satellite data found for tile {tile_id}")
+            
         logger.info(f"🛰️ Processing tile {tile_id} for date {date}")
 
         # Try raw bands first
         b04_url = build_b2_url("raw", tile_id, date, "B04.tif")
         b08_url = build_b2_url("raw", tile_id, date, "B08.tif")
         ndvi_url = build_b2_url("ndvi", tile_id, date, "ndvi.tif")
+
+        # Log URLs being tried
+        logger.info(f"🔍 Checking B04: {b04_url}")
+        logger.info(f"🔍 Checking B08: {b08_url}")
+        logger.info(f"🔍 Checking NDVI: {ndvi_url}")
 
         if check_b2_file_exists(b04_url) and check_b2_file_exists(b08_url):
             logger.info("✅ Found raw bands, computing NDVI")
@@ -271,7 +294,7 @@ def process_queue(limit=10, max_workers=4):
 def main():
     limit = int(os.getenv("NDVI_WORKER_LIMIT", 10))
     workers = int(os.getenv("NDVI_WORKER_THREADS", 4))
-    logger.info(f"🚀 NDVI Worker v4.2.0 starting | limit={limit}, threads={workers}")
+    logger.info(f"🚀 NDVI Worker v4.2.1 starting | limit={limit}, threads={workers}")
     process_queue(limit=limit, max_workers=workers)
     logger.info("🏁 NDVI Worker finished")
 
