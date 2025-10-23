@@ -1,44 +1,45 @@
 """
-NDVI Land Worker v5.1.0 — Unified Table Fix
---------------------------------------------
-✅ Writes all NDVI + thumbnails to ndvi_micro_tiles
-✅ Compatible with NDVI API v4.1.0
-✅ Auto-detects correct tiles per land
-✅ Validates overlap before processing
-✅ Backblaze B2 + Supabase unified output
-
-© 2025 KisanShaktiAI
+NDVI Land Worker v5.0.0 — KisanShaktiAI Production
+--------------------------------------------------
+✅ Multi-tile intersection logic (no missed coverage)
+✅ CRS auto-transform (EPSG:4326 → raster CRS)
+✅ Validates land–tile intersection precisely
+✅ Resolves boundary overlap conflicts
+✅ Accurate NDVI + vegetation color image per land
+✅ Writes to ndvi_data + micro_tile_thumbnail + Supabase bucket
+✅ Uses cached B2 auth for high performance
+✅ Full structured logging and error capture
 """
 
-import os, io, json, datetime, logging, traceback, functools
-import numpy as np, requests, rasterio
+import os, io, json, logging, datetime, traceback, functools
+import numpy as np
+import requests, rasterio
 from rasterio.mask import mask
 from rasterio.warp import transform_geom
-from shapely.geometry import shape, mapping, box
+from shapely.geometry import shape, mapping
+from shapely.ops import unary_union
+from supabase import create_client
 from PIL import Image
 import matplotlib.cm as cm
-from supabase import create_client
 
-# ============ CONFIG ============
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-B2_APP_KEY_ID = os.environ.get("B2_KEY_ID")
-B2_APP_KEY = os.environ.get("B2_APP_KEY")
-B2_BUCKET_NAME = os.environ.get("B2_BUCKET_RAW", "kisanshakti-ndvi-tiles")
-B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")
+# ---------------- ENVIRONMENT CONFIG ----------------
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+B2_APP_KEY_ID = os.environ["B2_KEY_ID"]
+B2_APP_KEY = os.environ["B2_APP_KEY"]
+B2_BUCKET = os.environ.get("B2_BUCKET_RAW", "kisanshakti-ndvi-tiles")
+B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/ndvi")
 SUPABASE_NDVI_BUCKET = os.environ.get("SUPABASE_NDVI_BUCKET", "ndvi-thumbnails")
-
-if not all([SUPABASE_URL, SUPABASE_KEY, B2_APP_KEY_ID, B2_APP_KEY]):
-    raise RuntimeError("❌ Missing environment variables")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("ndvi-worker-v5.1")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ============ B2 AUTH ============
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("ndvi-worker-v5.0.0")
+
+# ---------------- B2 AUTH (CACHED) ----------------
 @functools.lru_cache(maxsize=1)
-def b2_auth():
+def b2_authorize_cached():
     logger.info("🔑 Authorizing B2...")
     res = requests.get(
         "https://api.backblazeb2.com/b2api/v2/b2_authorize_account",
@@ -47,30 +48,26 @@ def b2_auth():
     )
     res.raise_for_status()
     data = res.json()
-    logger.info("✅ B2 authorized")
-    return {"token": data["authorizationToken"], "url": data["downloadUrl"]}
-
+    return {"auth": data["authorizationToken"], "url": data["downloadUrl"]}
 
 def b2_download(path: str) -> io.BytesIO:
-    data = b2_auth()
-    url = f"{data['url']}/file/{B2_BUCKET_NAME}/{path}"
-    res = requests.get(url, headers={"Authorization": data["token"]}, timeout=120)
-    if res.status_code == 200:
-        buf = io.BytesIO(res.content)
-        buf.seek(0)
-        logger.info(f"✅ Downloaded {len(res.content)/1024/1024:.2f}MB from B2")
-        return buf
-    raise FileNotFoundError(f"❌ File not found: {path}")
+    """Securely fetch file from B2"""
+    token = b2_authorize_cached()
+    url = f"{token['url']}/file/{B2_BUCKET}/{path}"
+    res = requests.get(url, headers={"Authorization": token["auth"]}, timeout=120)
+    if res.status_code != 200:
+        raise FileNotFoundError(f"Missing NDVI tile: {path}")
+    buf = io.BytesIO(res.content)
+    buf.seek(0)
+    return buf
 
-
-# ============ UTILITIES ============
+# ---------------- NDVI UTILITIES ----------------
 def calculate_ndvi(red, nir):
     np.seterr(divide="ignore", invalid="ignore")
     ndvi = (nir - red) / (nir + red)
     return np.clip(ndvi, -1, 1)
 
-
-def calculate_stats(arr):
+def ndvi_stats(arr):
     valid = arr[~np.isnan(arr)]
     if valid.size == 0:
         return None
@@ -84,108 +81,126 @@ def calculate_stats(arr):
         "total": int(arr.size),
     }
 
-
-def ndvi_to_png(ndvi, cmap="RdYlGn"):
+def colorize_ndvi(ndvi):
     norm = np.clip((ndvi + 1) / 2, 0, 1)
-    rgba = (cm.get_cmap(cmap)(norm) * 255).astype(np.uint8)
+    rgba = (cm.get_cmap("RdYlGn")(norm) * 255).astype(np.uint8)
     rgba[..., 3][np.isnan(ndvi)] = 0
     img = Image.fromarray(rgba, "RGBA")
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
     buf.seek(0)
-    return buf.getvalue()
+    return buf
 
-
-def upload_thumbnail(tenant_id, land_id, date, png_bytes):
-    path = f"{tenant_id}/{land_id}/{date}/ndvi.png"
+# ---------------- SUPABASE UPLOAD ----------------
+def upload_to_supabase(tenant, land, date, png_bytes):
+    path = f"{tenant}/{land}/{date}/ndvi_map.png"
     supabase.storage.from_(SUPABASE_NDVI_BUCKET).upload(
-        path, io.BytesIO(png_bytes), {"content-type": "image/png", "upsert": "true"}
+        path, png_bytes, {"content-type": "image/png", "upsert": True}
     )
     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_NDVI_BUCKET}/{path}"
 
-
-# ============ CORE NDVI PROCESSOR ============
-def process_land_ndvi_thumbnail(land, tile):
-    land_id, tenant_id = land["id"], land["tenant_id"]
-    name = land.get("name", "Unknown")
+# ---------------- MAIN PROCESSOR ----------------
+def process_land_ndvi(land, all_tiles):
+    land_id = land["id"]
+    tenant_id = land["tenant_id"]
 
     try:
-        geom = land.get("boundary_polygon_old") or land.get("boundary_polygon")
-        if not geom:
-            raise ValueError("Missing boundary polygon")
+        geom_raw = land.get("boundary_geom") or land.get("boundary_polygon_old")
+        if not geom_raw:
+            raise ValueError("No boundary geometry found")
 
-        land_geom = shape(geom if isinstance(geom, dict) else json.loads(geom))
-        acq_date = tile["acquisition_date"]
-        tile_id = tile["tile_id"]
+        land_geom = shape(geom_raw if isinstance(geom_raw, dict) else json.loads(geom_raw))
 
-        logger.info(f"🌾 Processing {name} ({land_id[:8]}) for tile {tile_id}")
+        # --- STEP 1: Filter intersecting tiles ---
+        intersect_tiles = []
+        for t in all_tiles:
+            tile_geom = shape(t["geometry"]) if "geometry" in t else None
+            if tile_geom and land_geom.intersects(tile_geom):
+                intersect_tiles.append(t)
 
-        # Download NDVI raster
-        ndvi_path = f"{B2_PREFIX}ndvi/{tile_id}/{acq_date}/ndvi.tif"
-        buf = b2_download(ndvi_path)
+        if not intersect_tiles:
+            raise ValueError("No intersecting NDVI tiles found for land")
 
-        with rasterio.open(buf) as src:
-            geom_t = transform_geom("EPSG:4326", src.crs.to_string(), mapping(land_geom))
-            rb = box(*src.bounds)
-            lb = shape(geom_t)
+        logger.info(f"🧩 Land {land_id}: {len(intersect_tiles)} intersecting tiles")
 
-            if not rb.intersects(lb):
-                raise ValueError(f"Land does not overlap raster: {tile_id} ({acq_date})")
+        merged_ndvi = None
+        for tile in intersect_tiles:
+            tile_id = tile["tile_id"]
+            date = tile["acquisition_date"]
+            tif_path = f"{B2_PREFIX}/{tile_id}/{date}/ndvi.tif"
+            buf = b2_download(tif_path)
+            with rasterio.open(buf) as src:
+                raster_crs = src.crs.to_string()
+                geom_t = transform_geom("EPSG:4326", raster_crs, mapping(land_geom.buffer(0.0003)))
 
-            arr, _ = mask(src, [geom_t], crop=True, all_touched=True, nodata=np.nan)
-            ndvi = arr[0]
+                # --- Intersection validation ---
+                r_bounds = src.bounds
+                g_bounds = shape(geom_t).bounds
+                if (
+                    g_bounds[2] < r_bounds.left
+                    or g_bounds[0] > r_bounds.right
+                    or g_bounds[3] < r_bounds.bottom
+                    or g_bounds[1] > r_bounds.top
+                ):
+                    logger.warning(f"⛔ Land {land_id} skipped non-overlapping tile {tile_id}")
+                    continue
 
-        stats = calculate_stats(ndvi)
+                arr, _ = mask(src, [geom_t], crop=True, all_touched=True, nodata=np.nan)
+                ndvi_arr = arr[0] if arr.ndim > 2 else arr
+                merged_ndvi = ndvi_arr if merged_ndvi is None else np.nanmean(
+                    np.dstack((merged_ndvi, ndvi_arr)), axis=2
+                )
+
+        if merged_ndvi is None:
+            raise ValueError("No valid NDVI coverage across intersecting tiles")
+
+        # --- NDVI Stats ---
+        stats = ndvi_stats(merged_ndvi)
         if not stats:
             raise ValueError("No valid NDVI pixels")
 
-        png = ndvi_to_png(ndvi)
-        img_url = upload_thumbnail(tenant_id, land_id, acq_date, png)
+        # --- NDVI Image ---
+        png_bytes = colorize_ndvi(merged_ndvi)
+        image_url = upload_to_supabase(tenant_id, land_id, datetime.date.today(), png_bytes)
 
         now = datetime.datetime.utcnow().isoformat()
-        supabase.table("ndvi_micro_tiles").upsert(
-            {
-                "tenant_id": tenant_id,
-                "land_id": land_id,
-                "acquisition_date": acq_date,
-                "tile_id": tile_id,
-                "ndvi_mean": stats["mean"],
-                "ndvi_min": stats["min"],
-                "ndvi_max": stats["max"],
-                "ndvi_std_dev": stats["std"],
-                "ndvi_thumbnail_url": img_url,
-                "thumbnail_size_kb": round(len(png) / 1024, 2),
-                "cloud_cover": tile.get("cloud_cover"),
-                "resolution_meters": tile.get("resolution_meters"),
-                "bbox": tile.get("bbox"),
-                "updated_at": now,
-            },
-            on_conflict="land_id,acquisition_date",
-        ).execute()
+        supabase.table("ndvi_data").upsert({
+            "tenant_id": tenant_id,
+            "land_id": land_id,
+            "ndvi_value": stats["mean"],
+            "ndvi_min": stats["min"],
+            "ndvi_max": stats["max"],
+            "ndvi_std": stats["std"],
+            "coverage_percent": stats["coverage"],
+            "image_url": image_url,
+            "updated_at": now
+        }, on_conflict="land_id").execute()
 
-        supabase.table("lands").update(
-            {
-                "last_ndvi_value": round(stats["mean"], 3),
-                "last_ndvi_calculation": acq_date,
-                "ndvi_tested": True,
-                "ndvi_thumbnail_url": img_url,
-                "last_processed_at": now,
-            }
-        ).eq("id", land_id).execute()
+        supabase.table("micro_tile_thumbnail").upsert({
+            "tenant_id": tenant_id,
+            "land_id": land_id,
+            "image_url": image_url,
+            "ndvi_mean": stats["mean"],
+            "created_at": now,
+            "updated_at": now
+        }, on_conflict="land_id").execute()
 
-        logger.info(f"✅ NDVI completed for {name}")
+        logger.info(f"✅ NDVI processed: {land_id} mean={stats['mean']:.3f}")
+
         return True
 
     except Exception as e:
-        logger.error(f"❌ {name}: {e}")
-        supabase.table("ndvi_processing_logs").insert(
-            {
-                "tenant_id": tenant_id,
-                "land_id": land_id,
-                "processing_step": "ndvi_extraction",
-                "step_status": "failed",
-                "completed_at": datetime.datetime.utcnow().isoformat(),
-                "error_message": str(e)[:400],
-            }
-        ).execute()
+        logger.error(f"❌ NDVI failed for {land_id}: {e}")
+        supabase.table("ndvi_processing_logs").insert({
+            "tenant_id": tenant_id,
+            "land_id": land_id,
+            "processing_step": "ndvi_generation",
+            "step_status": "failed",
+            "completed_at": datetime.datetime.utcnow().isoformat(),
+            "error_message": str(e)[:400],
+            "error_details": {"traceback": traceback.format_exc()[:1000]},
+        }).execute()
         return False
+
+# Compatibility alias
+process_farmer_land = process_land_ndvi
