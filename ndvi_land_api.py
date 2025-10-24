@@ -159,14 +159,16 @@ async def process_queue_item(request: Request):
         supabase.table("ndvi_request_queue").update({"status": "processing", "started_at": now_iso()}).eq("id", queue_id).execute()
 
         # import worker processing function
+      
         try:
-            from ndvi_land_worker import process_land_ndvi as process_request_sync
+            from ndvi_land_worker import process_request_sync
             logger.info("✅ NDVI worker module loaded successfully (ndvi_land_worker.py)")
         except ImportError as e:
             import traceback
             logger.error("❌ NDVI worker module import failed — ndvi_land_worker.py not found")
             logger.debug(traceback.format_exc())
             process_request_sync = None
+
 
         # call worker sync helper
         result = process_request_sync(queue_id=queue_id, tenant_id=tenant_id, land_ids=land_ids, tile_id=tile_id)
