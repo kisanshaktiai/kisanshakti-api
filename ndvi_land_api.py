@@ -160,11 +160,13 @@ async def process_queue_item(request: Request):
 
         # import worker processing function
         try:
-            # worker file expected in same project: ndvi_land_worker_v4.py
-            from ndvi_land_worker_v4 import process_request_sync  # type: ignore
-        except Exception as ex:
-            logger.exception("Worker module import failed")
-            raise HTTPException(status_code=500, detail="Worker module not available")
+            from ndvi_land_worker import process_land_ndvi as process_request_sync
+            logger.info("✅ NDVI worker module loaded successfully (ndvi_land_worker.py)")
+        except ImportError as e:
+            import traceback
+            logger.error("❌ NDVI worker module import failed — ndvi_land_worker.py not found")
+            logger.debug(traceback.format_exc())
+            process_request_sync = None
 
         # call worker sync helper
         result = process_request_sync(queue_id=queue_id, tenant_id=tenant_id, land_ids=land_ids, tile_id=tile_id)
