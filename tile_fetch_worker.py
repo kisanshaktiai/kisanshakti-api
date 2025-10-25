@@ -653,7 +653,8 @@ def process_tile(tile):
             "mgrs_tile_id": mgrs_tile_id,
             
             # Geometry
-            "bbox": json.dumps(bbox) if bbox else None,
+            "bbox": bbox if bbox else None,  # ✅ store proper JSON object, not string
+
         }
         
         # Add created_at only for new records
@@ -738,5 +739,6 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
 
 
