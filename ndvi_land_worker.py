@@ -25,8 +25,10 @@ from shapely.geometry import shape, mapping
 from PIL import Image
 import matplotlib.cm as cm
 from supabase import create_client
+
+# ✅ FIXED: Correct imports for b2sdk v2.x
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
-from b2sdk.download_dest import DownloadDestBytes
+from b2sdk.v2 import DownloadDestBytes  # ✅ Changed from b2sdk.download_dest
 
 # ---------------------------------------------------------------
 # Logging
