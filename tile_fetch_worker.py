@@ -235,17 +235,23 @@ def process_tile(tile):
         # ───────────────────────────────
         # ✅ PATCHED SECTION: safe geometry insertion
         # ───────────────────────────────
+       # ✅ Safe Geometry Handling (PostGIS-ready)
         bbox_geom_wkt = None
         try:
             if bbox and isinstance(bbox, dict):
                 geom_obj = shape(bbox)
-                bbox_geom_wkt = f"SRID=4326;{geom_obj.wkt}"
-                logging.info(f"✅ bbox_geom generated for {tile_id}: {bbox_geom_wkt[:80]}...")
+                # Ensure valid polygon and SRID
+                if geom_obj.is_valid:
+                    bbox_geom_wkt = f"SRID=4326;{geom_obj.wkt}"
+                    logging.info(f"✅ bbox_geom generated for {tile_id}: {bbox_geom_wkt[:80]}...")
+                else:
+                    logging.warning(f"⚠️ Invalid geometry for {tile_id}, skipping bbox_geom.")
             else:
-                logging.warning(f"⚠️ Invalid or missing bbox for {tile_id}")
+                logging.warning(f"⚠️ bbox missing or malformed for {tile_id}")
         except Exception as e:
-            logging.warning(f"⚠️ Failed to build bbox_geom for {tile_id}: {e}")
-
+            logging.warning(f"⚠️ Failed to generate bbox_geom for {tile_id}: {e}")
+        
+        # Prepare DB payload
         now = datetime.datetime.utcnow().isoformat() + "Z"
         payload = {
             "tile_id": tile_id,
@@ -253,26 +259,38 @@ def process_tile(tile):
             "collection": MPC_COLLECTION.upper(),
             "processing_level": "L2A",
             "cloud_cover": float(cloud_cover) if cloud_cover is not None else None,
+        
+            # Paths
             "red_band_path": red_b2,
             "nir_band_path": nir_b2,
             "ndvi_path": ndvi_b2,
+        
+            # File sizes
             "file_size_mb": round(total_size_mb, 2) if total_size_mb else None,
             "red_band_size_bytes": int(file_sizes.get("red")) if file_sizes.get("red") else None,
             "nir_band_size_bytes": int(file_sizes.get("nir")) if file_sizes.get("nir") else None,
             "ndvi_size_bytes": int(file_sizes.get("ndvi")) if file_sizes.get("ndvi") else None,
+        
+            # Resolution & status
             "resolution": "10m",
             "status": "ready",
             "updated_at": now,
             "processing_completed_at": now,
             "ndvi_calculation_timestamp": now,
+        
+            # Processing metadata
             "api_source": "planetary_computer",
             "processing_method": "cog_streaming",
             "actual_download_status": "downloaded",
             "processing_stage": "completed",
+        
+            # Foreign keys
             "country_id": country_id,
             "mgrs_tile_id": mgrs_tile_id,
-            "bbox": bbox if bbox else None,
-            "bbox_geom": bbox_geom_wkt,
+        
+            # Geometry (aligned with DB types)
+            "bbox": bbox if bbox else None,       # jsonb
+            "bbox_geom": bbox_geom_wkt            # geometry
         }
 
         # save unchanged...
@@ -319,3 +337,4 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
