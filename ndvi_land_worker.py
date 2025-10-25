@@ -21,7 +21,7 @@ import numpy as np
 import rasterio
 from rasterio.mask import mask
 from shapely.geometry import shape, mapping
-import mgrs
+
 from PIL import Image
 import matplotlib.cm as cm
 from supabase import create_client
