@@ -28,7 +28,7 @@ from supabase import create_client
 
 # ✅ FIXED: Correct imports for b2sdk v2.x
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
-from b2sdk.v2 import DownloadDestBytes  # ✅ Changed from b2sdk.download_dest
+from b2sdk.v2.exception import NonExistentBucket
 
 # ---------------------------------------------------------------
 # Logging
@@ -56,9 +56,15 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Initialize B2 API
 b2_info = InMemoryAccountInfo()
 b2_api = B2Api(b2_info)
+b2_bucket = None
+
 if B2_APP_KEY_ID and B2_APP_KEY:
-    b2_api.authorize_account("production", B2_APP_KEY_ID, B2_APP_KEY)
-    b2_bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
+    try:
+        b2_api.authorize_account("production", B2_APP_KEY_ID, B2_APP_KEY)
+        b2_bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
+        logger.info(f"✅ B2 initialized successfully: bucket={B2_BUCKET_NAME}")
+    except Exception as e:
+        logger.warning(f"⚠️ B2 initialization failed: {e}")
 else:
     logger.warning("⚠️ B2 credentials not set — NDVI worker cannot access B2 data")
 
@@ -117,15 +123,23 @@ def upload_thumbnail_to_supabase(land_id: str, date: str, png_bytes: bytes) -> O
         return None
 
 # ---------------------------------------------------------------
-# B2 Access
+# B2 Access - Using BytesIO instead of DownloadDestBytes
 # ---------------------------------------------------------------
 def download_b2_file(tile_id: str, subdir: str, filename: str) -> Optional[bytes]:
     """Download a raster (ndvi.tif, B04.tif, or B08.tif) from B2."""
+    if not b2_bucket:
+        logger.error("❌ B2 bucket not initialized")
+        return None
+    
     try:
         b2_path = f"tiles/{subdir}/{tile_id}/{filename}"
-        dest = DownloadDestBytes()
-        b2_bucket.download_file_by_name(b2_path, dest)
-        return dest.get_bytes_written()
+        
+        # ✅ Use BytesIO buffer instead of DownloadDestBytes
+        download_buffer = io.BytesIO()
+        b2_bucket.download_file_by_name(b2_path).save(download_buffer)
+        download_buffer.seek(0)
+        return download_buffer.read()
+        
     except Exception as e:
         logger.warning(f"⚠️ Missing B2 file {b2_path}: {e}")
         return None
