@@ -156,55 +156,56 @@ def upload_thumbnail_to_supabase_sync(land_id: str, date: str, png_bytes: bytes)
         return None
 
 
-# ----------------------------
-# Streaming NDVI (blocking functions run in threadpool)
-# ----------------------------
-def _make_b2_public_base_url() -> str:
-    return f"https://f000.backblazeb2.com/file/{B2_BUCKET_NAME}/tiles"
-
-
 def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Optional[np.ndarray]:
     """
-    Blocking: Try to read precomputed NDVI COG via HTTP range reads. If missing, read B04/B08 and compute.
-    Returns ndvi numpy array cropped to land_geom or None.
+    Try to stream NDVI GeoTIFF from B2.
+    If missing, compute from B04/B08. If all fail, return None (no crash).
     """
     base_url = _make_b2_public_base_url()
     ndvi_url = f"{base_url}/ndvi/{tile_id}/{acq_date}/ndvi.tif"
-    red_url = f"{base_url}/raw/{tile_id}/{acq_date}/B04.tif"
-    nir_url = f"{base_url}/raw/{tile_id}/{acq_date}/B08.tif"
+    red_url  = f"{base_url}/raw/{tile_id}/{acq_date}/B04.tif"
+    nir_url  = f"{base_url}/raw/{tile_id}/{acq_date}/B08.tif"
 
-    # Try NDVI directly
+    # --- 1️⃣ Try precomputed NDVI
     try:
         with rasterio.Env():
             with rasterio.open(ndvi_url) as src:
                 ndvi_clip, _ = mask(src, [land_geom], crop=True, all_touched=True)
                 if ndvi_clip.size == 0:
-                    raise ValueError("Empty NDVI clip")
+                    logger.warning(f"⚠️ Empty NDVI clip for {tile_id}/{acq_date}")
+                    return None
+                logger.info(f"🟢 Using precomputed NDVI for {tile_id}/{acq_date}")
                 return ndvi_clip[0]
     except RasterioIOError:
-        logger.debug(f"NDVI COG not found: {ndvi_url}")
+        logger.warning(f"⚠️ NDVI file missing: {ndvi_url}")
     except Exception as e:
-        logger.warning(f"NDVI COG read error ({ndvi_url}): {e}")
+        logger.warning(f"⚠️ Could not read NDVI COG ({tile_id}/{acq_date}): {e}")
 
-    # Fallback to B04/B08 compute
+    # --- 2️⃣ Compute NDVI from B04/B08 bands (fallback)
     try:
         with rasterio.Env():
             with rasterio.open(red_url) as red_src, rasterio.open(nir_url) as nir_src:
                 red_clip, _ = mask(red_src, [land_geom], crop=True, all_touched=True)
                 nir_clip, _ = mask(nir_src, [land_geom], crop=True, all_touched=True)
+
                 if red_clip.size == 0 or nir_clip.size == 0:
-                    logger.debug(f"No overlap for tile {tile_id} / date {acq_date}")
+                    logger.warning(f"⚠️ No overlap for tile {tile_id}/{acq_date}")
                     return None
+
                 red = red_clip[0].astype(np.float32)
                 nir = nir_clip[0].astype(np.float32)
                 ndvi = calculate_ndvi_from_bands(red, nir)
+                logger.info(f"🧮 Computed NDVI from B04/B08 for {tile_id}/{acq_date}")
                 return ndvi
-    except RasterioIOError as e:
-        logger.debug(f"Red/NIR COG not found for {tile_id}: {e}")
+    except RasterioIOError:
+        logger.warning(f"⚠️ Raw band file missing for {tile_id}/{acq_date}")
     except Exception as e:
-        logger.error(f"NDVI compute (B04/B08) failed for {tile_id}: {e}")
+        logger.error(f"❌ NDVI computation failed for {tile_id}/{acq_date}: {e}")
 
+    # --- 3️⃣ If all failed
+    logger.warning(f"🚫 No NDVI data found for {tile_id}/{acq_date}")
     return None
+
 
 
 # ----------------------------
