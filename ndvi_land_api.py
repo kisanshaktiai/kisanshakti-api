@@ -330,18 +330,22 @@ async def create_ndvi_request(
         instant_result = None
         final_status = "queued"
         
-         if request.instant:
+                 # Instant processing mode
+        if request.instant:
             try:
                 logger.info(f"⚡ Triggering instant processing for queue_id={queue_id}")
-        
+
+                # Import async worker
                 from ndvi_land_worker import process_request_async
                 import asyncio
-        
+
+                # Update queue to 'processing'
                 supabase.table("ndvi_request_queue").update({
                     "status": "processing",
                     "started_at": now_iso()
                 }).eq("id", queue_id).execute()
-        
+
+                # Run async worker synchronously
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 worker_result = loop.run_until_complete(
@@ -352,10 +356,11 @@ async def create_ndvi_request(
                     )
                 )
                 loop.close()
-        
+
                 instant_result = worker_result
                 final_status = "completed" if worker_result.get("processed_count", 0) > 0 else "failed"
-        
+
+                # Update queue with final status
                 supabase.table("ndvi_request_queue").update({
                     "status": final_status,
                     "processed_count": worker_result.get("processed_count", 0),
@@ -363,9 +368,9 @@ async def create_ndvi_request(
                     "completed_at": now_iso(),
                     "last_error": worker_result.get("error")
                 }).eq("id", queue_id).execute()
-        
+
                 logger.info(f"✅ Instant processing completed for {queue_id} → {final_status}")
-        
+
             except Exception as e:
                 logger.exception(f"❌ Instant processing failed for queue_id={queue_id}")
                 supabase.table("ndvi_request_queue").update({
@@ -373,7 +378,7 @@ async def create_ndvi_request(
                     "last_error": str(e)[:500],
                     "completed_at": now_iso()
                 }).eq("id", queue_id).execute()
-        
+
                 final_status = "failed"
                 instant_result = {"error": str(e)}
 
