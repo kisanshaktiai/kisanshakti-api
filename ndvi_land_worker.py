@@ -162,6 +162,10 @@ def get_intersecting_tiles(geometry: dict) -> List[dict]:
 def load_ndvi_from_tiles(tile_list: List[dict], land_geom: dict) -> np.ndarray:
     """Load and merge NDVI rasters for all intersecting tiles with CRS handling."""
     ndvi_crops = []
+    
+    # Debug: Log land geometry bounds
+    land_shape = shape(land_geom)
+    logger.info(f"📍 Land bounds (EPSG:4326): {land_shape.bounds}")
 
     for tile in tile_list:
         tile_id = tile["tile_id"]
@@ -179,10 +183,15 @@ def load_ndvi_from_tiles(tile_list: List[dict], land_geom: dict) -> np.ndarray:
             try:
                 with rasterio.MemoryFile(red_bytes) as red_mem, rasterio.MemoryFile(nir_bytes) as nir_mem:
                     with red_mem.open() as red_ds, nir_mem.open() as nir_ds:
+                        # Debug logging
+                        logger.info(f"🗺️ Tile {tile_id} CRS: {red_ds.crs}, Bounds: {red_ds.bounds}")
+                        
                         # Reproject geometry to match raster CRS
                         reprojected_geom = transform_geom(
                             "EPSG:4326", red_ds.crs, land_geom
                         )
+                        logger.info(f"🔄 Reprojected land bounds (to {red_ds.crs}): {shape(reprojected_geom).bounds}")
+                        
                         red_clip, _ = mask(red_ds, [reprojected_geom], crop=True, all_touched=True)
                         nir_clip, _ = mask(nir_ds, [reprojected_geom], crop=True, all_touched=True)
                         ndvi_crops.append(calculate_ndvi(red_clip[0], nir_clip[0]))
@@ -195,10 +204,15 @@ def load_ndvi_from_tiles(tile_list: List[dict], land_geom: dict) -> np.ndarray:
             try:
                 with rasterio.MemoryFile(ndvi_bytes) as mem:
                     with mem.open() as src:
+                        # Debug logging
+                        logger.info(f"🗺️ Tile {tile_id} CRS: {src.crs}, Bounds: {src.bounds}")
+                        
                         # Reproject geometry to match raster CRS
                         reprojected_geom = transform_geom(
                             "EPSG:4326", src.crs, land_geom
                         )
+                        logger.info(f"🔄 Reprojected land bounds (to {src.crs}): {shape(reprojected_geom).bounds}")
+                        
                         ndvi_clip, _ = mask(src, [reprojected_geom], crop=True, all_touched=True)
                         ndvi_crops.append(ndvi_clip[0])
                         logger.info(f"✅ Processed tile {tile_id} from NDVI")
