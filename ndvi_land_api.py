@@ -336,7 +336,7 @@ async def create_ndvi_request(
                 logger.info(f"⚡ Triggering instant processing for queue_id={queue_id}")
                 
                 # Import worker and process synchronously
-                from ndvi_land_worker import process_request_sync
+                from ndvi_land_worker import process_request_async
                 
                 # Update status to processing
                 supabase.table("ndvi_request_queue").update({
@@ -345,7 +345,7 @@ async def create_ndvi_request(
                 }).eq("id", queue_id).execute()
                 
                 # Execute processing
-                worker_result = process_request_sync(
+                worker_result = process_request_async(
                     queue_id=queue_id,
                     tenant_id=tenant_id,
                     land_ids=request.land_ids,
