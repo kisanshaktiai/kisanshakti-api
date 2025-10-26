@@ -1,11 +1,11 @@
 """
-NDVI Land Worker v6.0 — Multi-Tile B2 NDVI Engine
+NDVI Land Worker v6.1 — Multi-Tile B2 NDVI Engine with CRS Handling
 ---------------------------------------------------------------
 ✅ Computes NDVI using already-downloaded Sentinel tiles (B2)
 ✅ Finds all intersecting tiles for each land boundary
 ✅ Clips and merges NDVI rasters per land polygon
 ✅ Supports multi-tenant architecture
-✅ Inserts results into ndvi_data, ndvi_micro_tiles, updates lands
+✅ Handles CRS reprojection automatically
 """
 
 import os
@@ -20,7 +20,7 @@ from typing import List, Optional, Dict
 import numpy as np
 import rasterio
 from rasterio.mask import mask
-from rasterio.merge import merge
+from rasterio.warp import transform_geom
 from shapely.geometry import shape, mapping
 from PIL import Image
 import matplotlib.cm as cm
@@ -44,9 +44,9 @@ logger = logging.getLogger("ndvi-worker-v6")
 # ---------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-B2_APP_KEY_ID = os.getenv("B2_KEY_ID")
+B2_APP_KEY_ID = os.getenv("B2_APP_KEY_ID") or os.getenv("B2_KEY_ID")  # Support both variable names
 B2_APP_KEY = os.getenv("B2_APP_KEY")
-B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME", "kisanshakti-ndvi-tiles")
+B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME") or os.getenv("B2_BUCKET_RAW", "kisanshakti-ndvi-tiles")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("❌ Missing Supabase environment variables")
@@ -160,9 +160,8 @@ def get_intersecting_tiles(geometry: dict) -> List[dict]:
         return [t for t in tiles if g_land.intersects(shape(t.get("bbox") or t.get("geometry")))]
 
 def load_ndvi_from_tiles(tile_list: List[dict], land_geom: dict) -> np.ndarray:
-    """Load and merge NDVI rasters for all intersecting tiles."""
+    """Load and merge NDVI rasters for all intersecting tiles with CRS handling."""
     ndvi_crops = []
-    geom = [land_geom]
 
     for tile in tile_list:
         tile_id = tile["tile_id"]
@@ -170,28 +169,52 @@ def load_ndvi_from_tiles(tile_list: List[dict], land_geom: dict) -> np.ndarray:
         ndvi_bytes = download_b2_file(tile_id, "ndvi", f"{acq_date}/ndvi.tif")
 
         if not ndvi_bytes:
+            # Try raw bands
             red_bytes = download_b2_file(tile_id, "raw", f"{acq_date}/B04.tif")
             nir_bytes = download_b2_file(tile_id, "raw", f"{acq_date}/B08.tif")
             if not (red_bytes and nir_bytes):
                 logger.warning(f"Tile {tile_id} missing raw bands or ndvi.tif")
                 continue
-            with rasterio.MemoryFile(red_bytes) as red_mem, rasterio.MemoryFile(nir_bytes) as nir_mem:
-                with red_mem.open() as red_ds, nir_mem.open() as nir_ds:
-                    red_clip, _ = mask(red_ds, geom, crop=True)
-                    nir_clip, _ = mask(nir_ds, geom, crop=True)
-                    ndvi_crops.append(calculate_ndvi(red_clip[0], nir_clip[0]))
+            
+            try:
+                with rasterio.MemoryFile(red_bytes) as red_mem, rasterio.MemoryFile(nir_bytes) as nir_mem:
+                    with red_mem.open() as red_ds, nir_mem.open() as nir_ds:
+                        # Reproject geometry to match raster CRS
+                        reprojected_geom = transform_geom(
+                            "EPSG:4326", red_ds.crs, land_geom
+                        )
+                        red_clip, _ = mask(red_ds, [reprojected_geom], crop=True, all_touched=True)
+                        nir_clip, _ = mask(nir_ds, [reprojected_geom], crop=True, all_touched=True)
+                        ndvi_crops.append(calculate_ndvi(red_clip[0], nir_clip[0]))
+                        logger.info(f"✅ Processed tile {tile_id} from raw bands")
+            except ValueError as e:
+                logger.warning(f"Skipping tile {tile_id} (raw): {e}")
+                continue
         else:
-            with rasterio.MemoryFile(ndvi_bytes) as mem:
-                with mem.open() as src:
-                    ndvi_clip, _ = mask(src, geom, crop=True)
-                    ndvi_crops.append(ndvi_clip[0])
+            # Use pre-computed NDVI
+            try:
+                with rasterio.MemoryFile(ndvi_bytes) as mem:
+                    with mem.open() as src:
+                        # Reproject geometry to match raster CRS
+                        reprojected_geom = transform_geom(
+                            "EPSG:4326", src.crs, land_geom
+                        )
+                        ndvi_clip, _ = mask(src, [reprojected_geom], crop=True, all_touched=True)
+                        ndvi_crops.append(ndvi_clip[0])
+                        logger.info(f"✅ Processed tile {tile_id} from NDVI")
+            except ValueError as e:
+                logger.warning(f"Skipping tile {tile_id} (ndvi): {e}")
+                continue
 
     if not ndvi_crops:
         raise RuntimeError("No NDVI data found in intersecting tiles")
+    
     if len(ndvi_crops) == 1:
         return ndvi_crops[0]
-    merged, _ = merge([rasterio.io.MemoryFile(c.astype(np.float32)).open(driver="MEM") for c in ndvi_crops])
-    return merged[0]
+    
+    # Merge multiple NDVI arrays using nanmean
+    logger.info(f"🔗 Merging {len(ndvi_crops)} NDVI crops")
+    return np.nanmean(ndvi_crops, axis=0)
 
 # ---------------------------------------------------------------
 # Core Processing
@@ -293,7 +316,7 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=3)
     args = parser.parse_args()
 
-    logger.info(f"Starting NDVI Land Worker v6.0 — limit={args.limit}")
+    logger.info(f"Starting NDVI Land Worker v6.1 — limit={args.limit}")
     try:
         jobs = supabase.table("ndvi_request_queue").select("*").eq("status", "queued").limit(args.limit).execute()
         for job in jobs.data or []:
@@ -302,4 +325,4 @@ if __name__ == "__main__":
             process_request_sync(queue_id, tenant_id, land_ids)
     except Exception:
         logger.exception("Fatal NDVI worker error")
-    logger.info("NDVI Land Worker v6.0 finished.")
+    logger.info("NDVI Land Worker v6.1 finished.")
