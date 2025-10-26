@@ -44,7 +44,11 @@ import matplotlib.cm as cm
 
 from supabase import create_client, Client
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
-from b2sdk.v2 import DownloadDestBytes
+try:
+    from b2sdk.download.dest import DownloadDestBytes  # >=2.0
+except ImportError:
+    from b2sdk.v2 import DownloadDestBytes  # legacy fallback
+
 
 
 # =============================================================================
