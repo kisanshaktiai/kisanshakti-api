@@ -178,15 +178,17 @@ def _get_signed_b2_url(file_path: str, valid_secs: int = 3600) -> Optional[str]:
     Works on free-tier buckets that are not public.
     """
     try:
+        # ✅ Corrected parameter name: valid_duration_in_seconds
         auth_token = b2_bucket.get_download_authorization(
             file_name_prefix=file_path,
-            valid_duration_seconds=valid_secs
+            valid_duration_in_seconds=valid_secs
         )
-        # Region-specific base domain (f005 used in your account)
+        # ✅ Use your correct region endpoint (f005)
         return f"https://f005.backblazeb2.com/file/{B2_BUCKET_NAME}/{file_path}?Authorization={auth_token}"
     except Exception as e:
         logger.error(f"Failed to sign B2 URL for {file_path}: {e}")
         return None
+
 
 
 def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Optional[np.ndarray]:
