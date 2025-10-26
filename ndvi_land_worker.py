@@ -172,23 +172,44 @@ def upload_thumbnail_to_supabase_sync(land_id: str, date: str, png_bytes: bytes)
 # ----------------------------
 # Helper: Build public B2 base URL
 # ----------------------------
-def _make_b2_public_base_url() -> str:
-    """Return the base public Backblaze B2 URL for NDVI tiles."""
-    # Uses your configured B2 bucket name from env
-    return f"https://f000.backblazeb2.com/file/{B2_BUCKET_NAME}/tiles"
-
+def _get_signed_b2_url(file_path: str, valid_secs: int = 3600) -> Optional[str]:
+    """
+    Generate a temporary signed URL for a private Backblaze B2 object.
+    Works on free-tier buckets that are not public.
+    """
+    try:
+        auth_token = b2_bucket.get_download_authorization(
+            file_name_prefix=file_path,
+            valid_duration_seconds=valid_secs
+        )
+        # Region-specific base domain (f005 used in your account)
+        return f"https://f005.backblazeb2.com/file/{B2_BUCKET_NAME}/{file_path}?Authorization={auth_token}"
+    except Exception as e:
+        logger.error(f"Failed to sign B2 URL for {file_path}: {e}")
+        return None
 
 
 def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Optional[np.ndarray]:
     """
-    Try to stream NDVI GeoTIFF from B2.
-    If missing, compute from B04/B08. If all fail, return None (no crash).
-    """
-    base_url = _make_b2_public_base_url()
-    ndvi_url = f"{base_url}/ndvi/{tile_id}/{acq_date}/ndvi.tif"
-    red_url  = f"{base_url}/raw/{tile_id}/{acq_date}/B04.tif"
-    nir_url  = f"{base_url}/raw/{tile_id}/{acq_date}/B08.tif"
+    Try to stream NDVI GeoTIFF from Backblaze B2 (private bucket).
+    If missing, compute NDVI from B04/B08. If all fail, return None (no crash).
 
+    Works with free/private B2 buckets by generating temporary signed URLs
+    using b2sdk.get_download_authorization().
+    """
+    # Build private B2 file paths (same as tile_fetch_worker)
+    ndvi_path = f"tiles/ndvi/{tile_id}/{acq_date}/ndvi.tif"
+    red_path  = f"tiles/raw/{tile_id}/{acq_date}/B04.tif"
+    nir_path  = f"tiles/raw/{tile_id}/{acq_date}/B08.tif"
+
+    # Generate signed URLs (valid 1 hour)
+    ndvi_url = _get_signed_b2_url(ndvi_path)
+    red_url  = _get_signed_b2_url(red_path)
+    nir_url  = _get_signed_b2_url(nir_path)
+
+    if not ndvi_url or not red_url or not nir_url:
+        logger.warning(f"⚠️ Could not sign one or more B2 URLs for {tile_id}/{acq_date}")
+    
     # --- 1️⃣ Try precomputed NDVI
     try:
         with rasterio.Env():
@@ -200,11 +221,11 @@ def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Option
                 logger.info(f"🟢 Using precomputed NDVI for {tile_id}/{acq_date}")
                 return ndvi_clip[0]
     except RasterioIOError:
-        logger.warning(f"⚠️ NDVI file missing: {ndvi_url}")
+        logger.warning(f"⚠️ NDVI file missing or private: {ndvi_path}")
     except Exception as e:
-        logger.warning(f"⚠️ Could not read NDVI COG ({tile_id}/{acq_date}): {e}")
+        logger.warning(f"⚠️ Could not read NDVI GeoTIFF ({tile_id}/{acq_date}): {e}")
 
-    # --- 2️⃣ Compute NDVI from B04/B08 bands (fallback)
+    # --- 2️⃣ Fallback: Compute NDVI from B04/B08 bands
     try:
         with rasterio.Env():
             with rasterio.open(red_url) as red_src, rasterio.open(nir_url) as nir_src:
@@ -228,7 +249,6 @@ def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Option
     # --- 3️⃣ If all failed
     logger.warning(f"🚫 No NDVI data found for {tile_id}/{acq_date}")
     return None
-
 
 
 # ----------------------------
