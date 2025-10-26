@@ -139,21 +139,44 @@ def create_colorized_thumbnail(ndvi_array: np.ndarray, max_size: int = 512) -> b
 
 
 def upload_thumbnail_to_supabase_sync(land_id: str, date: str, png_bytes: bytes) -> Optional[str]:
-    """Blocking upload to supabase storage (run in threadpool)."""
+    """
+    Uploads a colorized NDVI thumbnail PNG to Supabase Storage.
+    Runs in a threadpool (blocking-safe).
+    """
     try:
         path = f"{land_id}/{date}/ndvi_colorized.png"
-        # supabase-py storage upload: file param can be bytes or file-like
+
+        # Upload with overwrite (upsert=True)
         supabase.storage.from_(SUPABASE_NDVI_BUCKET).upload(
             path=path,
             file=png_bytes,
-            file_options={"content-type": "image/png", "upsert": "true"},
+            file_options={
+                "content_type": "image/png",
+                "upsert": True,  # boolean not string
+            },
         )
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_NDVI_BUCKET}/{path}"
-        logger.debug(f"Uploaded thumbnail for {land_id} -> {public_url}")
+
+        public_url = (
+            f"{SUPABASE_URL}/storage/v1/object/public/"
+            f"{SUPABASE_NDVI_BUCKET}/{path}"
+        )
+
+        logger.info(f"🖼️ Uploaded NDVI thumbnail for land {land_id} ({len(png_bytes)/1024:.1f} KB) → {public_url}")
         return public_url
+
     except Exception as e:
-        logger.error(f"Thumbnail upload failed (land={land_id}): {e}")
+        logger.error(f"❌ Thumbnail upload failed for land {land_id}: {e}", exc_info=True)
         return None
+
+
+# ----------------------------
+# Helper: Build public B2 base URL
+# ----------------------------
+def _make_b2_public_base_url() -> str:
+    """Return the base public Backblaze B2 URL for NDVI tiles."""
+    # Uses your configured B2 bucket name from env
+    return f"https://f000.backblazeb2.com/file/{B2_BUCKET_NAME}/tiles"
+
 
 
 def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Optional[np.ndarray]:
