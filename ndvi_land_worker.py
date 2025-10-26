@@ -44,7 +44,8 @@ import matplotlib.cm as cm
 
 from supabase import create_client, Client
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
-from b2sdk.download_dest import DownloadDestBytes
+from b2sdk.v2 import DownloadDestBytes
+
 
 # =============================================================================
 # Configuration & Logging
