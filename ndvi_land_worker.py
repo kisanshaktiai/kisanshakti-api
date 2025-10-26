@@ -48,7 +48,7 @@ logger = logging.getLogger("ndvi-worker-async")
 # ----------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-B2_APP_KEY_ID = os.getenv("B2_APP_KEY_ID")
+B2_APP_KEY_ID = os.getenv("B2_KEY_ID")
 B2_APP_KEY = os.getenv("B2_APP_KEY")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME", "kisanshakti-ndvi-tiles")
 SUPABASE_NDVI_BUCKET = os.getenv("SUPABASE_NDVI_BUCKET", "ndvi-thumbnails")
@@ -60,8 +60,8 @@ THREAD_POOL_WORKERS = int(os.getenv("THREAD_POOL_WORKERS", "12"))  # threadpool 
 # Validate env
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
-if not B2_APP_KEY_ID or not B2_APP_KEY:
-    raise RuntimeError("Missing B2_APP_KEY_ID or B2_APP_KEY")
+if not B2_KEY_ID or not B2_APP_KEY:
+    raise RuntimeError("Missing B2_KEY_ID or B2_APP_KEY")
 
 # ----------------------------
 # Clients init (sync) - will be used in threadpool
@@ -70,7 +70,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 b2_info = InMemoryAccountInfo()
 b2_api = B2Api(b2_info)
-b2_api.authorize_account("production", B2_APP_KEY_ID, B2_APP_KEY)
+b2_api.authorize_account("production", B2_KEY_ID, B2_APP_KEY)
 try:
     b2_bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
     logger.info(f"✅ B2 bucket accessible: {B2_BUCKET_NAME}")
