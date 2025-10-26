@@ -1,12 +1,11 @@
 """
 """
-ndvi_land_worker.py
-NDVI Land Worker v8.0 — Multi-Tile + Async Orchestration
-✅ Uses lands.tile_ids[] for NDVI coverage across multiple tiles
-✅ Streams NDVI COGs directly from Backblaze
-✅ Writes NDVI stats + colorized thumbnails to Supabase
+# ndvi_land_worker.py
+# NDVI Land Worker v8.0 — Multi-Tile + Async Orchestration
+# ✅ Uses lands.tile_ids[] for NDVI coverage across multiple tiles
+# ✅ Streams NDVI COGs directly from Backblaze
+# ✅ Writes NDVI stats + colorized thumbnails to Supabase
 """
-
 
 import os
 import io
