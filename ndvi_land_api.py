@@ -336,7 +336,7 @@ async def create_ndvi_request(
                 logger.info(f"⚡ Triggering instant processing for queue_id={queue_id}")
                 
                 # Import async worker
-                from ndvi_land_worker_v8_modular import process_request_async
+                from ndvi_land_worker import process_request_async
                 import asyncio
                 from concurrent.futures import ThreadPoolExecutor
 
