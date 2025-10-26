@@ -22,6 +22,9 @@ Features:
 ✅ Memory-efficient streaming from B2
 """
 
+# =============================================================================
+# Imports
+# =============================================================================
 import os
 import io
 import json
@@ -37,15 +40,14 @@ import rasterio
 from rasterio.mask import mask
 from rasterio.merge import merge
 from rasterio.io import MemoryFile
-from rasterio.warp import calculate_default_transform, reproject, Resampling
 from shapely.geometry import shape, mapping
 from PIL import Image
 import matplotlib.cm as cm
 
 from supabase import create_client, Client
 
-# ✅ Modern B2 SDK imports for version >= 2.6.0 (your current 2.10.1)
-from b2sdk.v2 import InMemoryAccountInfo, B2Api, DownloadDestBytesBuffer
+# ✅ Modern B2 SDK imports for streaming architecture (v2.6.0+)
+from b2sdk.v2 import InMemoryAccountInfo, B2Api
 
 # =============================================================================
 # Configuration & Logging
