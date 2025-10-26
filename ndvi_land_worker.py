@@ -282,36 +282,31 @@ async def process_single_land_async(
         geom_raw = land.get("boundary") or land.get("boundary_geom") or land.get("boundary_polygon_old")
         if not geom_raw:
             raise ValueError("Missing geometry")
-        geometry = json.loads(geom_raw) if isinstance(geom_raw, str) else geom_raw
 
-        # Determine tiles to process (priority: land.tile_ids → API tile_ids → fallback)
-        if land.get("tile_ids"):
-            tiles_to_try = [t for t in land["tile_ids"] if t]
-        elif tile_ids:
-            tiles_to_try = tile_ids
-        else:
-            # fallback RPC or bbox intersection
+        # Robust geometry loader — handles JSON, WKT, or multiple JSONs
+        geometry = None
+        if isinstance(geom_raw, dict):
+            geometry = geom_raw
+        elif isinstance(geom_raw, str):
             try:
-                resp = supabase.rpc("get_intersecting_tiles", {"land_geom": json.dumps(geometry)}).execute()
-                tiles_to_try = [t["tile_id"] for t in (resp.data or []) if "tile_id" in t]
-            except Exception:
-                candidate_resp = supabase.table("mgrs_tiles").select("tile_id, bbox").execute()
-                candidate_tiles = candidate_resp.data or []
-                land_shape = shape(geometry)
-                tiles_to_try = []
-                for t in candidate_tiles:
-                    try:
-                        t_bbox = t.get("bbox")
-                        if not t_bbox:
-                            continue
-                        tile_shape = shape(json.loads(t_bbox) if isinstance(t_bbox, str) else t_bbox)
-                        if land_shape.intersects(tile_shape):
-                            tiles_to_try.append(t["tile_id"])
-                    except Exception:
-                        continue
+                # Case 1: pure JSON
+                geometry = json.loads(geom_raw.strip())
+            except json.JSONDecodeError:
+                try:
+                    # Case 2: WKT (e.g. "SRID=4326;POLYGON(...)")
+                    from shapely import wkt
+                    geometry = json.loads(json.dumps(shape(wkt.loads(geom_raw)).__geo_interface__))
+                except Exception:
+                    # Case 3: malformed string, try first valid JSON block
+                    first_brace = geom_raw.find("{")
+                    last_brace = geom_raw.rfind("}")
+                    if first_brace != -1 and last_brace != -1:
+                        geometry = json.loads(geom_raw[first_brace:last_brace+1])
+                    else:
+                        raise ValueError("Invalid geometry format: cannot parse")
+        else:
+            raise ValueError("Unsupported geometry type")
 
-        if not tiles_to_try:
-            raise ValueError("No intersecting tiles found")
 
         ndvi_clips: List[np.ndarray] = []
 
