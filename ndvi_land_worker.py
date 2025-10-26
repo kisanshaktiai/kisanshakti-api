@@ -193,13 +193,14 @@ def _get_signed_b2_url(file_path: str, valid_secs: int = 3600) -> Optional[str]:
 
 def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Optional[np.ndarray]:
     """
-    Try to stream NDVI GeoTIFF from Backblaze B2 (private bucket).
-    If missing, compute NDVI from B04/B08. If all fail, return None (no crash).
-
-    Works with free/private B2 buckets by generating temporary signed URLs
-    using b2sdk.get_download_authorization().
+    Stream NDVI GeoTIFF from private Backblaze B2.
+    - Tries precomputed NDVI first (tiles/ndvi/.../ndvi.tif)
+    - Falls back to raw B04/B08 bands if NDVI is missing
+    - Auto-reprojects land geometry (EPSG:4326 → raster CRS)
+    - Returns NDVI numpy array cropped to land polygon
     """
-    # Build private B2 file paths (same as tile_fetch_worker)
+
+    # Build private B2 file paths
     ndvi_path = f"tiles/ndvi/{tile_id}/{acq_date}/ndvi.tif"
     red_path  = f"tiles/raw/{tile_id}/{acq_date}/B04.tif"
     nir_path  = f"tiles/raw/{tile_id}/{acq_date}/B08.tif"
@@ -211,28 +212,67 @@ def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Option
 
     if not ndvi_url or not red_url or not nir_url:
         logger.warning(f"⚠️ Could not sign one or more B2 URLs for {tile_id}/{acq_date}")
-    
-    # --- 1️⃣ Try precomputed NDVI
+
+    # ────────────────────────────────────────────────
+    # Helper: Reproject geom to raster CRS if needed
+    # ────────────────────────────────────────────────
+    from shapely.geometry import shape, mapping
+    import pyproj
+    from shapely.ops import transform
+
+    def _reproject_geom_to_raster(geom, raster_crs):
+        """Ensure land geometry matches raster CRS (EPSG:4326 → target CRS)."""
+        try:
+            geom_shape = shape(geom)
+            if raster_crs and raster_crs.to_string() != "EPSG:4326":
+                project = pyproj.Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True).transform
+                geom_shape = transform(project, geom_shape)
+                logger.debug(f"🧭 Reprojected land geometry to {raster_crs}")
+            return mapping(geom_shape)
+        except Exception as e:
+            logger.warning(f"⚠️ Reprojection failed: {e}")
+            return geom
+
+    # ────────────────────────────────────────────────
+    # Step 1️⃣ — Try precomputed NDVI GeoTIFF
+    # ────────────────────────────────────────────────
     try:
         with rasterio.Env():
             with rasterio.open(ndvi_url) as src:
-                ndvi_clip, _ = mask(src, [land_geom], crop=True, all_touched=True)
+                land_geom_proj = _reproject_geom_to_raster(land_geom, src.crs)
+
+                logger.debug(f"Raster CRS: {src.crs}, bounds: {src.bounds}")
+                from shapely.geometry import shape
+                logger.debug(f"Land bounds: {shape(land_geom_proj).bounds}")
+
+                ndvi_clip, _ = mask(src, [land_geom_proj], crop=True, all_touched=True)
                 if ndvi_clip.size == 0:
                     logger.warning(f"⚠️ Empty NDVI clip for {tile_id}/{acq_date}")
                     return None
+
                 logger.info(f"🟢 Using precomputed NDVI for {tile_id}/{acq_date}")
                 return ndvi_clip[0]
+    except ValueError as e:
+        if "Input shapes do not overlap raster" in str(e):
+            logger.warning(f"⚠️ Land geom does not overlap NDVI raster for {tile_id}/{acq_date}")
+        else:
+            logger.warning(f"⚠️ NDVI read failed for {tile_id}/{acq_date}: {e}")
     except RasterioIOError:
         logger.warning(f"⚠️ NDVI file missing or private: {ndvi_path}")
     except Exception as e:
         logger.warning(f"⚠️ Could not read NDVI GeoTIFF ({tile_id}/{acq_date}): {e}")
 
-    # --- 2️⃣ Fallback: Compute NDVI from B04/B08 bands
+    # ────────────────────────────────────────────────
+    # Step 2️⃣ — Fallback: Compute NDVI from B04/B08
+    # ────────────────────────────────────────────────
     try:
         with rasterio.Env():
             with rasterio.open(red_url) as red_src, rasterio.open(nir_url) as nir_src:
-                red_clip, _ = mask(red_src, [land_geom], crop=True, all_touched=True)
-                nir_clip, _ = mask(nir_src, [land_geom], crop=True, all_touched=True)
+                # Reproject to red band CRS (they share same CRS)
+                land_geom_proj = _reproject_geom_to_raster(land_geom, red_src.crs)
+
+                red_clip, _ = mask(red_src, [land_geom_proj], crop=True, all_touched=True)
+                nir_clip, _ = mask(nir_src, [land_geom_proj], crop=True, all_touched=True)
 
                 if red_clip.size == 0 or nir_clip.size == 0:
                     logger.warning(f"⚠️ No overlap for tile {tile_id}/{acq_date}")
@@ -243,15 +283,21 @@ def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Option
                 ndvi = calculate_ndvi_from_bands(red, nir)
                 logger.info(f"🧮 Computed NDVI from B04/B08 for {tile_id}/{acq_date}")
                 return ndvi
+    except ValueError as e:
+        if "Input shapes do not overlap raster" in str(e):
+            logger.warning(f"⚠️ Land geom does not overlap raw bands for {tile_id}/{acq_date}")
+        else:
+            logger.error(f"❌ NDVI computation failed for {tile_id}/{acq_date}: {e}")
     except RasterioIOError:
         logger.warning(f"⚠️ Raw band file missing for {tile_id}/{acq_date}")
     except Exception as e:
         logger.error(f"❌ NDVI computation failed for {tile_id}/{acq_date}: {e}")
 
-    # --- 3️⃣ If all failed
+    # ────────────────────────────────────────────────
+    # Step 3️⃣ — If all failed
+    # ────────────────────────────────────────────────
     logger.warning(f"🚫 No NDVI data found for {tile_id}/{acq_date}")
     return None
-
 
 # ----------------------------
 # DB helpers (blocking) to run in threadpool
