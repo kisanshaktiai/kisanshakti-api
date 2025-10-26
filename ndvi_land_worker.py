@@ -1,11 +1,12 @@
 """
-ndvi_land_worker_v7_async.py
-NDVI Land Worker v7.1 — Streaming + Async Orchestration (Threadpool)
-- Streams COGs from Backblaze B2 (no full downloads)
-- Falls back to compute NDVI from B04/B08
-- Parallel processing of lands per queue using asyncio + ThreadPoolExecutor
-- Writes to ndvi_data, ndvi_micro_tiles, lands, ndvi_processing_logs
 """
+ndvi_land_worker.py
+NDVI Land Worker v8.0 — Multi-Tile + Async Orchestration
+✅ Uses lands.tile_ids[] for NDVI coverage across multiple tiles
+✅ Streams NDVI COGs directly from Backblaze
+✅ Writes NDVI stats + colorized thumbnails to Supabase
+"""
+
 
 import os
 import io
@@ -254,37 +255,41 @@ async def process_single_land_async(
     result: Dict[str, Any] = {"land_id": land_id, "success": False, "error": None, "stats": None}
 
     try:
-        geom_raw = land.get("boundary_polygon_old") or land.get("boundary")
+        geom_raw = land.get("boundary_polygon_old") or land.get("boundary_geom") or land.get("boundary")
         if not geom_raw:
             raise ValueError("Missing geometry")
         geometry = json.loads(geom_raw) if isinstance(geom_raw, str) else geom_raw
 
-        # Determine tiles to process
-        if tile_ids:
-            tiles_to_try = tile_ids
+        # Determine tiles to process (priority: land.tile_ids → API tile_ids → fallback)
+        if land.get("tile_ids"):
+            tiles_to_try = [t for t in land["tile_ids"] if t]  # from DB
+        elif tile_ids:
+            tiles_to_try = tile_ids  # from API
         else:
-            # call RPC or fallback: query satellite_tiles for tiles overlapping bbox? For simplicity, use mgrs_tiles intersection RPC if available.
-            # Here we attempt to call a RPC 'get_intersecting_tiles' — if not available, fallback to mgrs_tiles intersection by bbox.
+            # fallback: use intersection RPC or simple bbox overlap
             try:
                 resp = supabase.rpc("get_intersecting_tiles", {"land_geom": json.dumps(geometry)}).execute()
-                tiles_to_try = [t["tile_id"] for t in (resp.data or [])] if getattr(resp, "data", None) else []
-            except Exception:
-                # fallback get candidate tiles from mgrs_tiles (simple bbox overlap)
+                tiles_to_try = [t["tile_id"] for t in (resp.data or []) if "tile_id" in t]
+            except Exception as rpc_error:
+                logger.warning(f"RPC fallback for land {land_id}: {rpc_error}")
                 candidate_resp = supabase.table("mgrs_tiles").select("tile_id, bbox").execute()
                 candidate_tiles = candidate_resp.data or []
-                tiles_to_try = []
                 land_shape = shape(geometry)
+                tiles_to_try = []
                 for t in candidate_tiles:
                     try:
                         t_bbox = t.get("bbox")
                         if not t_bbox:
                             continue
-                        t_geom = t_bbox if isinstance(t_bbox, dict) else json.loads(t_bbox)
-                        tile_shape = shape(t_geom)
+                        tile_shape = shape(json.loads(t_bbox) if isinstance(t_bbox, str) else t_bbox)
                         if land_shape.intersects(tile_shape):
                             tiles_to_try.append(t["tile_id"])
                     except Exception:
                         continue
+
+        if not tiles_to_try:
+            raise ValueError("No intersecting tiles found (tile_ids empty)")
+
 
         if not tiles_to_try:
             raise ValueError("No intersecting tiles found")
