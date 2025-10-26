@@ -1,5 +1,5 @@
 """
-NDVI Land Worker v6.0 - Production NDVI Processing Engine
+NDVI Land Worker v6.1 - Production NDVI Processing Engine
 ==========================================================
 Processes NDVI from already-downloaded Sentinel-2 tiles stored in B2.
 
@@ -43,13 +43,9 @@ from PIL import Image
 import matplotlib.cm as cm
 
 from supabase import create_client, Client
-from b2sdk.v2 import InMemoryAccountInfo, B2Api
-try:
-    from b2sdk.download.dest import DownloadDestBytes  # >=2.0
-except ImportError:
-    from b2sdk.v2 import DownloadDestBytes  # legacy fallback
 
-
+# ✅ Modern B2 SDK imports for version >= 2.6.0 (your current 2.10.1)
+from b2sdk.v2 import InMemoryAccountInfo, B2Api, DownloadDestBytesBuffer
 
 # =============================================================================
 # Configuration & Logging
@@ -79,7 +75,7 @@ if not B2_APP_KEY_ID or not B2_APP_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 logger.info(f"✅ Supabase client initialized")
 
-# Initialize B2 API
+# Initialize B2 API (modern)
 b2_info = InMemoryAccountInfo()
 b2_api = B2Api(b2_info)
 b2_api.authorize_account("production", B2_APP_KEY_ID, B2_APP_KEY)
@@ -102,27 +98,24 @@ def calculate_ndvi(red: np.ndarray, nir: np.ndarray) -> np.ndarray:
     np.seterr(divide='ignore', invalid='ignore')
     ndvi = (nir.astype(float) - red.astype(float)) / (nir.astype(float) + red.astype(float))
     ndvi = np.clip(ndvi, -1, 1)
-    ndvi[np.isnan(ndvi)] = -1  # Set NaN to -1 (no data)
+    ndvi[np.isnan(ndvi)] = -1
     return ndvi
 
 def calculate_statistics(ndvi_array: np.ndarray) -> Dict[str, Any]:
-    """Compute comprehensive statistics from NDVI raster"""
+    """Compute NDVI statistics"""
     valid_mask = (ndvi_array >= -1) & (ndvi_array <= 1) & ~np.isnan(ndvi_array)
     valid_pixels = ndvi_array[valid_mask]
-    
     total_pixels = int(ndvi_array.size)
     valid_count = int(valid_pixels.size)
-    
+
     if valid_count == 0:
         return {
             "mean": None, "min": None, "max": None, "std": None,
             "valid_pixels": 0, "total_pixels": total_pixels,
             "coverage": 0.0, "health_category": "no_data"
         }
-    
+
     mean_ndvi = float(np.mean(valid_pixels))
-    
-    # Categorize vegetation health
     if mean_ndvi < 0.2:
         health = "poor"
     elif mean_ndvi < 0.4:
@@ -131,7 +124,7 @@ def calculate_statistics(ndvi_array: np.ndarray) -> Dict[str, Any]:
         health = "good"
     else:
         health = "excellent"
-    
+
     return {
         "mean": float(mean_ndvi),
         "min": float(np.min(valid_pixels)),
@@ -144,103 +137,65 @@ def calculate_statistics(ndvi_array: np.ndarray) -> Dict[str, Any]:
     }
 
 def create_colorized_thumbnail(ndvi_array: np.ndarray, max_size: int = 512) -> bytes:
-    """
-    Generate a beautiful colorized PNG thumbnail from NDVI array.
-    Uses RdYlGn (Red-Yellow-Green) colormap for vegetation visualization.
-    """
-    # Normalize NDVI to 0-1 range
+    """Generate a colorized PNG thumbnail from NDVI"""
     normalized = np.clip((ndvi_array + 1) / 2, 0, 1)
-    
-    # Apply colormap
     cmap = cm.get_cmap('RdYlGn')
     rgba = (cmap(normalized) * 255).astype(np.uint8)
-    
-    # Set transparent for no-data pixels
     rgba[..., 3][ndvi_array == -1] = 0
-    
-    # Create PIL Image
     img = Image.fromarray(rgba, mode='RGBA')
-    
-    # Resize if too large
     if max(img.size) > max_size:
         img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-    
-    # Save to bytes
     buffer = io.BytesIO()
     img.save(buffer, format='PNG', optimize=True)
     buffer.seek(0)
-    
     return buffer.getvalue()
 
 def upload_thumbnail_to_supabase(land_id: str, date: str, png_bytes: bytes) -> Optional[str]:
-    """Upload NDVI thumbnail to Supabase Storage"""
+    """Upload NDVI thumbnail to Supabase"""
     try:
         path = f"{land_id}/{date}/ndvi_colorized.png"
-        
-        # Upload with upsert
-        result = supabase.storage.from_(SUPABASE_NDVI_BUCKET).upload(
+        supabase.storage.from_(SUPABASE_NDVI_BUCKET).upload(
             path=path,
             file=png_bytes,
             file_options={"content-type": "image/png", "upsert": "true"}
         )
-        
-        # Generate public URL
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_NDVI_BUCKET}/{path}"
-        
-        logger.debug(f"📤 Thumbnail uploaded: {path}")
-        return public_url
-        
+        return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_NDVI_BUCKET}/{path}"
     except Exception as e:
-        logger.error(f"❌ Thumbnail upload failed for land {land_id}: {e}")
+        logger.error(f"❌ Thumbnail upload failed: {e}")
         return None
 
 # =============================================================================
-# B2 Data Access
+# B2 Data Access (updated for v2.10.1)
 # =============================================================================
 def download_from_b2(tile_id: str, subdir: str, filename: str) -> Optional[bytes]:
     """
-    Download a file from B2 cloud storage.
-    
-    Args:
-        tile_id: MGRS tile ID (e.g., '43RGN')
-        subdir: Subdirectory ('ndvi', 'raw', 'composite')
-        filename: File name (e.g., '2024-01-15/ndvi.tif', '2024-01-15/B04.tif')
-    
-    Returns:
-        File bytes or None if not found
+    Download a file from B2 using DownloadDestBytesBuffer (modern SDK).
     """
+    b2_path = f"tiles/{subdir}/{tile_id}/{filename}"
     try:
-        b2_path = f"tiles/{subdir}/{tile_id}/{filename}"
-        logger.debug(f"⬇️  Downloading from B2: {b2_path}")
-        
-        dest = DownloadDestBytes()
+        logger.debug(f"⬇️ Downloading from B2: {b2_path}")
+        dest = DownloadDestBytesBuffer()
         b2_bucket.download_file_by_name(b2_path, dest)
-        
         data = dest.get_bytes_written()
         logger.debug(f"✅ Downloaded {len(data)} bytes from {b2_path}")
-        
         return data
-        
     except Exception as e:
-        logger.warning(f"⚠️  B2 download failed: {b2_path} | {e}")
+        logger.warning(f"⚠️ B2 download failed: {b2_path} | {e}")
         return None
 
 def get_latest_tile_date(tile_id: str) -> Optional[str]:
-    """Find the most recent acquisition date for a tile in satellite_tiles table"""
+    """Get latest acquisition date for a tile"""
     try:
         response = supabase.table("satellite_tiles").select("acquisition_date").eq(
             "tile_id", tile_id
         ).eq("status", "completed").order("acquisition_date", desc=True).limit(1).execute()
-        
         if response.data:
             return response.data[0]["acquisition_date"]
-        
-        logger.warning(f"⚠️  No completed tiles found for {tile_id}")
         return None
-        
     except Exception as e:
         logger.error(f"❌ Failed to query satellite_tiles: {e}")
         return None
+
 
 # =============================================================================
 # Geospatial Processing
