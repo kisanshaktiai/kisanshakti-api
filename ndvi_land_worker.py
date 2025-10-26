@@ -1,9 +1,12 @@
 """
 ndvi_land_worker.py
 NDVI Land Worker v8.0 — Multi-Tile + Async Orchestration
-✅ Uses lands.tile_ids[] for NDVI coverage across multiple tiles
-✅ Streams NDVI COGs directly from Backblaze
-✅ Writes NDVI stats + colorized thumbnails to Supabase
+
+- Uses lands.tile_ids[] for NDVI coverage across multiple tiles
+- Streams NDVI COGs directly from Backblaze (HTTP range reads via rasterio)
+- Falls back to compute NDVI from B04/B08 if precomputed NDVI isn't present
+- Parallelizes land processing with asyncio + ThreadPoolExecutor for blocking work
+- Writes NDVI stats + colorized thumbnails to Supabase
 """
 
 import os
@@ -38,7 +41,7 @@ from b2sdk.v2 import InMemoryAccountInfo, B2Api
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("ndvi-worker-async")
 
@@ -107,7 +110,7 @@ def calculate_statistics(ndvi: np.ndarray) -> Dict[str, Any]:
             "std": None,
             "valid_pixels": 0,
             "total_pixels": total_pixels,
-            "coverage": 0.0
+            "coverage": 0.0,
         }
     return {
         "mean": float(np.mean(valid_pixels)),
@@ -116,7 +119,7 @@ def calculate_statistics(ndvi: np.ndarray) -> Dict[str, Any]:
         "std": float(np.std(valid_pixels)),
         "valid_pixels": valid_count,
         "total_pixels": total_pixels,
-        "coverage": float(valid_count / total_pixels * 100)
+        "coverage": float(valid_count / total_pixels * 100),
     }
 
 
@@ -124,6 +127,7 @@ def create_colorized_thumbnail(ndvi_array: np.ndarray, max_size: int = 512) -> b
     norm = np.clip((ndvi_array + 1) / 2, 0, 1)
     cmap = cm.get_cmap("RdYlGn")
     rgba = (cmap(norm) * 255).astype(np.uint8)
+    # make nodata transparent
     rgba[..., 3][ndvi_array == -1] = 0
     img = Image.fromarray(rgba, mode="RGBA")
     if max(img.size) > max_size:
@@ -135,12 +139,14 @@ def create_colorized_thumbnail(ndvi_array: np.ndarray, max_size: int = 512) -> b
 
 
 def upload_thumbnail_to_supabase_sync(land_id: str, date: str, png_bytes: bytes) -> Optional[str]:
+    """Blocking upload to supabase storage (run in threadpool)."""
     try:
         path = f"{land_id}/{date}/ndvi_colorized.png"
+        # supabase-py storage upload: file param can be bytes or file-like
         supabase.storage.from_(SUPABASE_NDVI_BUCKET).upload(
             path=path,
             file=png_bytes,
-            file_options={"content-type": "image/png", "upsert": "true"}
+            file_options={"content-type": "image/png", "upsert": "true"},
         )
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_NDVI_BUCKET}/{path}"
         logger.debug(f"Uploaded thumbnail for {land_id} -> {public_url}")
@@ -150,16 +156,24 @@ def upload_thumbnail_to_supabase_sync(land_id: str, date: str, png_bytes: bytes)
         return None
 
 
+# ----------------------------
+# Streaming NDVI (blocking functions run in threadpool)
+# ----------------------------
 def _make_b2_public_base_url() -> str:
     return f"https://f000.backblazeb2.com/file/{B2_BUCKET_NAME}/tiles"
 
 
 def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Optional[np.ndarray]:
+    """
+    Blocking: Try to read precomputed NDVI COG via HTTP range reads. If missing, read B04/B08 and compute.
+    Returns ndvi numpy array cropped to land_geom or None.
+    """
     base_url = _make_b2_public_base_url()
     ndvi_url = f"{base_url}/ndvi/{tile_id}/{acq_date}/ndvi.tif"
     red_url = f"{base_url}/raw/{tile_id}/{acq_date}/B04.tif"
     nir_url = f"{base_url}/raw/{tile_id}/{acq_date}/B08.tif"
 
+    # Try NDVI directly
     try:
         with rasterio.Env():
             with rasterio.open(ndvi_url) as src:
@@ -172,6 +186,7 @@ def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Option
     except Exception as e:
         logger.warning(f"NDVI COG read error ({ndvi_url}): {e}")
 
+    # Fallback to B04/B08 compute
     try:
         with rasterio.Env():
             with rasterio.open(red_url) as red_src, rasterio.open(nir_url) as nir_src:
@@ -180,21 +195,33 @@ def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Option
                 if red_clip.size == 0 or nir_clip.size == 0:
                     logger.debug(f"No overlap for tile {tile_id} / date {acq_date}")
                     return None
-                ndvi = calculate_ndvi_from_bands(red_clip[0], nir_clip[0])
+                red = red_clip[0].astype(np.float32)
+                nir = nir_clip[0].astype(np.float32)
+                ndvi = calculate_ndvi_from_bands(red, nir)
                 return ndvi
+    except RasterioIOError as e:
+        logger.debug(f"Red/NIR COG not found for {tile_id}: {e}")
     except Exception as e:
         logger.error(f"NDVI compute (B04/B08) failed for {tile_id}: {e}")
 
     return None
 
+
 # ----------------------------
-# DB Helpers
+# DB helpers (blocking) to run in threadpool
 # ----------------------------
 def get_latest_tile_date_sync(tile_id: str) -> Optional[str]:
+    """Query satellite_tiles for latest completed acquisition_date for tile"""
     try:
-        resp = supabase.table("satellite_tiles").select("acquisition_date").eq(
-            "tile_id", tile_id
-        ).eq("status", "ready").order("acquisition_date", desc=True).limit(1).execute()
+        resp = (
+            supabase.table("satellite_tiles")
+            .select("acquisition_date")
+            .eq("tile_id", tile_id)
+            .eq("status", "ready")
+            .order("acquisition_date", desc=True)
+            .limit(1)
+            .execute()
+        )
         if resp.data:
             return resp.data[0]["acquisition_date"]
     except Exception as e:
@@ -229,18 +256,26 @@ def insert_processing_log_sync(record: Dict[str, Any]) -> None:
     except Exception as e:
         logger.error(f"ndvi_processing_logs insert failed: {e}")
 
+
 # ----------------------------
-# Land Processing
+# Single land processing (async wrapper)
 # ----------------------------
 async def process_single_land_async(
     land: Dict[str, Any],
     tile_ids: Optional[List[str]],
     acquisition_date_override: Optional[str],
-    executor: ThreadPoolExecutor
+    executor: ThreadPoolExecutor,
 ) -> Dict[str, Any]:
+    """
+    Orchestrates processing for a single land record:
+    - finds tile dates
+    - streams NDVI / computes fallback
+    - computes stats, generates thumbnail
+    - uploads thumbnail & writes DB records
+    """
     loop = asyncio.get_running_loop()
-    land_id = land["id"]
-    tenant_id = land["tenant_id"]
+    land_id = land.get("id")
+    tenant_id = land.get("tenant_id")
     result: Dict[str, Any] = {"land_id": land_id, "success": False, "error": None, "stats": None}
 
     try:
@@ -249,17 +284,17 @@ async def process_single_land_async(
             raise ValueError("Missing geometry")
         geometry = json.loads(geom_raw) if isinstance(geom_raw, str) else geom_raw
 
-        # Determine tiles to process (priority: DB → API → fallback)
+        # Determine tiles to process (priority: land.tile_ids → API tile_ids → fallback)
         if land.get("tile_ids"):
             tiles_to_try = [t for t in land["tile_ids"] if t]
         elif tile_ids:
             tiles_to_try = tile_ids
         else:
+            # fallback RPC or bbox intersection
             try:
                 resp = supabase.rpc("get_intersecting_tiles", {"land_geom": json.dumps(geometry)}).execute()
                 tiles_to_try = [t["tile_id"] for t in (resp.data or []) if "tile_id" in t]
-            except Exception as rpc_error:
-                logger.warning(f"RPC fallback for land {land_id}: {rpc_error}")
+            except Exception:
                 candidate_resp = supabase.table("mgrs_tiles").select("tile_id, bbox").execute()
                 candidate_tiles = candidate_resp.data or []
                 land_shape = shape(geometry)
@@ -276,20 +311,27 @@ async def process_single_land_async(
                         continue
 
         if not tiles_to_try:
-            raise ValueError("No intersecting tiles found (tile_ids empty)")
+            raise ValueError("No intersecting tiles found")
 
-        ndvi_clips = []
+        ndvi_clips: List[np.ndarray] = []
+
+        # For each tile, find latest date (or use override) and stream NDVI
         for tile_id in tiles_to_try:
             acq_date = acquisition_date_override or await loop.run_in_executor(executor, get_latest_tile_date_sync, tile_id)
             if not acq_date:
+                logger.debug(f"No acquisition date found for tile {tile_id}, skipping")
                 continue
+
             ndvi = await loop.run_in_executor(executor, stream_ndvi_blocking, tile_id, acq_date, geometry)
-            if ndvi is not None:
-                ndvi_clips.append(ndvi)
+            if ndvi is None:
+                logger.debug(f"No NDVI for tile {tile_id}/{acq_date}")
+                continue
+            ndvi_clips.append(ndvi)
 
         if not ndvi_clips:
             raise ValueError("No NDVI data extracted from intersecting tiles")
 
+        # Merge/stack clips
         if len(ndvi_clips) == 1:
             final_ndvi = ndvi_clips[0]
         else:
@@ -298,14 +340,17 @@ async def process_single_land_async(
             except Exception:
                 final_ndvi = ndvi_clips[0]
 
+        # Stats
         stats = calculate_statistics(final_ndvi)
         if stats["valid_pixels"] == 0:
             raise ValueError("No valid NDVI pixels after processing")
 
+        # Thumbnail
         acq_date_for_record = acquisition_date_override or datetime.date.today().isoformat()
         thumbnail_bytes = await loop.run_in_executor(executor, create_colorized_thumbnail, final_ndvi)
         thumbnail_url = await loop.run_in_executor(executor, upload_thumbnail_to_supabase_sync, land_id, acq_date_for_record, thumbnail_bytes)
 
+        # Prepare DB records
         ndvi_data_record = {
             "tenant_id": tenant_id,
             "land_id": land_id,
@@ -318,14 +363,31 @@ async def process_single_land_async(
             "coverage_percentage": stats["coverage"],
             "image_url": thumbnail_url,
             "created_at": now_iso(),
-            "computed_at": now_iso()
+            "computed_at": now_iso(),
         }
 
+        micro_tile_record = {
+            "tenant_id": tenant_id,
+            "land_id": land_id,
+            "acquisition_date": acq_date_for_record,
+            "ndvi_mean": stats["mean"],
+            "ndvi_min": stats["min"],
+            "ndvi_max": stats["max"],
+            "ndvi_std_dev": stats["std"],
+            "ndvi_thumbnail_url": thumbnail_url,
+            "bbox": geometry if isinstance(geometry, dict) else None,
+            "cloud_cover": 0,
+            "created_at": now_iso(),
+        }
+
+        # Write DB records (blocking - run in executor)
         await loop.run_in_executor(executor, upsert_ndvi_data_sync, ndvi_data_record)
+        await loop.run_in_executor(executor, upsert_micro_tile_sync, micro_tile_record)
         await loop.run_in_executor(executor, update_land_sync, land_id, {
             "last_ndvi_value": stats["mean"],
+            "last_ndvi_calculation": acq_date_for_record,
             "ndvi_thumbnail_url": thumbnail_url,
-            "updated_at": now_iso()
+            "updated_at": now_iso(),
         })
 
         result["success"] = True
@@ -335,13 +397,28 @@ async def process_single_land_async(
 
     except Exception as e:
         tb = traceback.format_exc()
-        logger.error(f"❌ Failed land {land.get('id')}: {e}\n{tb}")
+        logger.error(f"❌ Failed land {land.get('id') if isinstance(land, dict) else 'unknown'}: {e}\n{tb}")
         result["error"] = str(e)
+        # best-effort logging
+        try:
+            log_record = {
+                "tenant_id": land.get("tenant_id") if isinstance(land, dict) else None,
+                "land_id": land.get("id") if isinstance(land, dict) else None,
+                "processing_step": "ndvi_async",
+                "step_status": "failed",
+                "error_message": str(e)[:500],
+                "error_details": {"traceback": tb[:1000]},
+                "created_at": now_iso(),
+            }
+            await asyncio.get_running_loop().run_in_executor(executor, insert_processing_log_sync, log_record)
+        except Exception:
+            logger.debug("Failed to write processing log")
 
     return result
 
+
 # ----------------------------
-# Orchestrator
+# Orchestrator for a queue item
 # ----------------------------
 async def process_request_async(queue_id: str, tenant_id: str, land_ids: List[str], tile_ids: Optional[List[str]] = None):
     logger.info(f"🚀 Starting async processing: queue={queue_id} tenant={tenant_id} lands={len(land_ids)}")
@@ -380,18 +457,22 @@ async def process_request_async(queue_id: str, tenant_id: str, land_ids: List[st
             "processed_count": processed,
             "failed_count": len(failed),
             "processing_duration_ms": duration_ms,
-            "completed_at": now_iso()
+            "completed_at": now_iso(),
         }).eq("id", queue_id).execute()
     except Exception as e:
         logger.error(f"Failed to update queue status for {queue_id}: {e}")
 
     logger.info(f"🏁 Queue {queue_id} finished: processed={processed}/{len(lands)} duration={duration_ms}ms failed={len(failed)}")
-    return {"queue_id": queue_id, "processed_count": processed, "failed_count": len(failed)}
+    return {"queue_id": queue_id, "processed_count": processed, "failed_count": len(failed), "failed": failed, "duration_ms": duration_ms}
+
 
 # ----------------------------
-# CLI Entry
+# Cron style runner (sync entry)
 # ----------------------------
 def run_cron(limit: int = 10, max_retries: int = 3):
+    """
+    Synchronous entrypoint to pick queued requests and run async processing for each.
+    """
     logger.info("🔄 NDVI async worker starting (cron)")
     try:
         queue_resp = supabase.table("ndvi_request_queue").select("*").eq("status", "queued").order("created_at", desc=False).limit(limit).execute()
@@ -405,10 +486,22 @@ def run_cron(limit: int = 10, max_retries: int = 3):
         tenant_id = item["tenant_id"]
         land_ids = item.get("land_ids", [])
         tile_id = item.get("tile_id")
+        retry_count = item.get("retry_count", 0)
 
+        if retry_count >= max_retries:
+            logger.warning(f"Max retries reached for {queue_id}, marking failed")
+            supabase.table("ndvi_request_queue").update({
+                "status": "failed",
+                "last_error": f"Max retries ({max_retries}) exceeded",
+                "completed_at": now_iso(),
+            }).eq("id", queue_id).execute()
+            return
+
+        # mark processing
         supabase.table("ndvi_request_queue").update({
             "status": "processing",
-            "started_at": now_iso()
+            "started_at": now_iso(),
+            "retry_count": retry_count + 1,
         }).eq("id", queue_id).execute()
 
         try:
@@ -418,7 +511,7 @@ def run_cron(limit: int = 10, max_retries: int = 3):
             logger.exception(f"Failed processing queue {queue_id}: {e}")
             supabase.table("ndvi_request_queue").update({
                 "status": "queued",
-                "last_error": str(e)[:500]
+                "last_error": str(e)[:500],
             }).eq("id", queue_id).execute()
 
     loop = asyncio.new_event_loop()
@@ -429,6 +522,9 @@ def run_cron(limit: int = 10, max_retries: int = 3):
     logger.info("✅ Cron run finished")
 
 
+# ----------------------------
+# Main entrypoint (CLI)
+# ----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NDVI Land Worker v8 Async")
     parser.add_argument("--mode", choices=["cron", "single"], default="cron")
