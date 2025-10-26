@@ -257,9 +257,9 @@ def insert_processing_log_sync(record: Dict[str, Any]) -> None:
         logger.error(f"ndvi_processing_logs insert failed: {e}")
 
 
-# ----------------------------
-# Single land processing (async wrapper)
-# ----------------------------
+# =========================================================
+# SINGLE LAND PROCESSING (v8.1) — unified + robust
+# =========================================================
 async def process_single_land_async(
     land: Dict[str, Any],
     tile_ids: Optional[List[str]],
@@ -267,66 +267,122 @@ async def process_single_land_async(
     executor: ThreadPoolExecutor,
 ) -> Dict[str, Any]:
     """
-    Orchestrates processing for a single land record:
-    - finds tile dates
-    - streams NDVI / computes fallback
-    - computes stats, generates thumbnail
-    - uploads thumbnail & writes DB records
+    Processes a single land parcel for NDVI:
+      ✅ Handles WKT / WKB / GeoJSON geometry
+      ✅ Uses all intersecting tiles
+      ✅ Computes NDVI, stats, and thumbnail
+      ✅ Writes to ndvi_data + ndvi_micro_tiles
     """
     loop = asyncio.get_running_loop()
     land_id = land.get("id")
     tenant_id = land.get("tenant_id")
-    result: Dict[str, Any] = {"land_id": land_id, "success": False, "error": None, "stats": None}
+
+    result: Dict[str, Any] = {
+        "land_id": land_id,
+        "success": False,
+        "error": None,
+        "stats": None,
+    }
 
     try:
+        # ---------------------------------------------------------
+        # 1️⃣ Load geometry safely (GeoJSON / WKT / WKB)
+        # ---------------------------------------------------------
         geom_raw = land.get("boundary") or land.get("boundary_geom") or land.get("boundary_polygon_old")
         if not geom_raw:
             raise ValueError("Missing geometry")
 
-        # Robust geometry loader — handles JSON, WKT, or multiple JSONs
+        from shapely import wkt, wkb
+        from shapely.geometry import shape
+
         geometry = None
+
         if isinstance(geom_raw, dict):
             geometry = geom_raw
         elif isinstance(geom_raw, str):
+            geom_raw = geom_raw.strip()
             try:
-                # Case 1: pure JSON
-                geometry = json.loads(geom_raw.strip())
+                # Case 1: GeoJSON string
+                geometry = json.loads(geom_raw)
             except json.JSONDecodeError:
+                geometry = None
+
+            # Case 2: WKT
+            if geometry is None and geom_raw.upper().startswith(("POLYGON", "MULTIPOLYGON", "LINESTRING", "POINT")):
                 try:
-                    # Case 2: WKT (e.g. "SRID=4326;POLYGON(...)")
-                    from shapely import wkt
-                    geometry = json.loads(json.dumps(shape(wkt.loads(geom_raw)).__geo_interface__))
+                    shapely_geom = wkt.loads(geom_raw)
+                    geometry = json.loads(json.dumps(shapely_geom.__geo_interface__))
                 except Exception:
-                    # Case 3: malformed string, try first valid JSON block
-                    first_brace = geom_raw.find("{")
-                    last_brace = geom_raw.rfind("}")
-                    if first_brace != -1 and last_brace != -1:
-                        geometry = json.loads(geom_raw[first_brace:last_brace+1])
-                    else:
-                        raise ValueError("Invalid geometry format: cannot parse")
+                    pass
+
+            # Case 3: WKB HEX (PostGIS EWKB)
+            if geometry is None and geom_raw.startswith("010"):
+                try:
+                    geom_bytes = bytes.fromhex(geom_raw)
+                    shapely_geom = wkb.loads(geom_bytes)
+                    geometry = json.loads(json.dumps(shapely_geom.__geo_interface__))
+                except Exception:
+                    pass
+
+        if not geometry:
+            raise ValueError("Invalid geometry format: cannot parse")
+
+        # ---------------------------------------------------------
+        # 2️⃣ Determine intersecting tiles
+        # ---------------------------------------------------------
+        if land.get("tile_ids"):
+            tiles_to_try = [t for t in land["tile_ids"] if t]
+        elif tile_ids:
+            tiles_to_try = tile_ids
         else:
-            raise ValueError("Unsupported geometry type")
+            try:
+                resp = supabase.rpc("get_intersecting_tiles", {"land_geom": json.dumps(geometry)}).execute()
+                tiles_to_try = [t["tile_id"] for t in (resp.data or []) if "tile_id" in t]
+            except Exception as rpc_error:
+                logger.warning(f"⚠️ RPC fallback for land {land_id}: {rpc_error}")
+                candidate_resp = supabase.table("mgrs_tiles").select("tile_id, bbox").execute()
+                candidate_tiles = candidate_resp.data or []
+                from shapely.geometry import shape as shp_shape
+                land_shape = shp_shape(geometry)
+                tiles_to_try = []
+                for t in candidate_tiles:
+                    try:
+                        t_bbox = t.get("bbox")
+                        if not t_bbox:
+                            continue
+                        tile_shape = shp_shape(json.loads(t_bbox) if isinstance(t_bbox, str) else t_bbox)
+                        if land_shape.intersects(tile_shape):
+                            tiles_to_try.append(t["tile_id"])
+                    except Exception:
+                        continue
 
+        if not tiles_to_try:
+            raise ValueError("No intersecting tiles found (tile_ids empty)")
 
+        logger.info(f"🌍 Land {land_id} intersects {len(tiles_to_try)} tiles: {tiles_to_try}")
+
+        # ---------------------------------------------------------
+        # 3️⃣ Stream NDVI for each tile and merge results
+        # ---------------------------------------------------------
         ndvi_clips: List[np.ndarray] = []
-
-        # For each tile, find latest date (or use override) and stream NDVI
         for tile_id in tiles_to_try:
-            acq_date = acquisition_date_override or await loop.run_in_executor(executor, get_latest_tile_date_sync, tile_id)
+            acq_date = acquisition_date_override or await loop.run_in_executor(
+                executor, get_latest_tile_date_sync, tile_id
+            )
             if not acq_date:
                 logger.debug(f"No acquisition date found for tile {tile_id}, skipping")
                 continue
 
             ndvi = await loop.run_in_executor(executor, stream_ndvi_blocking, tile_id, acq_date, geometry)
             if ndvi is None:
-                logger.debug(f"No NDVI for tile {tile_id}/{acq_date}")
+                logger.debug(f"No NDVI data for tile {tile_id}/{acq_date}")
                 continue
+
             ndvi_clips.append(ndvi)
 
         if not ndvi_clips:
             raise ValueError("No NDVI data extracted from intersecting tiles")
 
-        # Merge/stack clips
         if len(ndvi_clips) == 1:
             final_ndvi = ndvi_clips[0]
         else:
@@ -335,17 +391,22 @@ async def process_single_land_async(
             except Exception:
                 final_ndvi = ndvi_clips[0]
 
-        # Stats
+        # ---------------------------------------------------------
+        # 4️⃣ Compute statistics + thumbnail
+        # ---------------------------------------------------------
         stats = calculate_statistics(final_ndvi)
         if stats["valid_pixels"] == 0:
             raise ValueError("No valid NDVI pixels after processing")
 
-        # Thumbnail
         acq_date_for_record = acquisition_date_override or datetime.date.today().isoformat()
         thumbnail_bytes = await loop.run_in_executor(executor, create_colorized_thumbnail, final_ndvi)
-        thumbnail_url = await loop.run_in_executor(executor, upload_thumbnail_to_supabase_sync, land_id, acq_date_for_record, thumbnail_bytes)
+        thumbnail_url = await loop.run_in_executor(
+            executor, upload_thumbnail_to_supabase_sync, land_id, acq_date_for_record, thumbnail_bytes
+        )
 
-        # Prepare DB records
+        # ---------------------------------------------------------
+        # 5️⃣ Prepare DB records
+        # ---------------------------------------------------------
         ndvi_data_record = {
             "tenant_id": tenant_id,
             "land_id": land_id,
@@ -375,7 +436,9 @@ async def process_single_land_async(
             "created_at": now_iso(),
         }
 
-        # Write DB records (blocking - run in executor)
+        # ---------------------------------------------------------
+        # 6️⃣ Write to Supabase (sync in thread executor)
+        # ---------------------------------------------------------
         await loop.run_in_executor(executor, upsert_ndvi_data_sync, ndvi_data_record)
         await loop.run_in_executor(executor, upsert_micro_tile_sync, micro_tile_record)
         await loop.run_in_executor(executor, update_land_sync, land_id, {
@@ -390,24 +453,27 @@ async def process_single_land_async(
         result["thumbnail_url"] = thumbnail_url
         logger.info(f"✅ Processed land {land_id} (mean={stats['mean']:.3f}, coverage={stats['coverage']:.1f}%)")
 
+    # -------------------------------------------------------------
+    # 7️⃣ Error Handling & Logging
+    # -------------------------------------------------------------
     except Exception as e:
         tb = traceback.format_exc()
-        logger.error(f"❌ Failed land {land.get('id') if isinstance(land, dict) else 'unknown'}: {e}\n{tb}")
+        logger.error(f"❌ Failed land {land_id}: {e}\n{tb}")
         result["error"] = str(e)
-        # best-effort logging
+
         try:
             log_record = {
-                "tenant_id": land.get("tenant_id") if isinstance(land, dict) else None,
-                "land_id": land.get("id") if isinstance(land, dict) else None,
+                "tenant_id": tenant_id,
+                "land_id": land_id,
                 "processing_step": "ndvi_async",
                 "step_status": "failed",
                 "error_message": str(e)[:500],
                 "error_details": {"traceback": tb[:1000]},
                 "created_at": now_iso(),
             }
-            await asyncio.get_running_loop().run_in_executor(executor, insert_processing_log_sync, log_record)
-        except Exception:
-            logger.debug("Failed to write processing log")
+            await loop.run_in_executor(executor, insert_processing_log_sync, log_record)
+        except Exception as log_err:
+            logger.debug(f"Failed to write processing log for {land_id}: {log_err}")
 
     return result
 
