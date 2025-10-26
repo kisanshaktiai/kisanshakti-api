@@ -148,16 +148,46 @@ def download_b2_file(tile_id: str, subdir: str, filename: str) -> Optional[bytes
 # Tile and Raster Logic
 # ---------------------------------------------------------------
 def get_intersecting_tiles(geometry: dict) -> List[dict]:
-    """Return all tiles that intersect a given land boundary."""
+    """Return all tiles that intersect a given land boundary with buffer."""
     try:
         resp = supabase.rpc("get_intersecting_tiles", {"land_geom": json.dumps(geometry)}).execute()
         return resp.data or []
     except Exception as e:
-        logger.warning(f"⚠️ Fallback to full scan, RPC get_intersecting_tiles failed: {e}")
-        # fallback: full scan with shapely intersection (if RPC not deployed)
+        logger.warning(f"⚠️ Fallback: searching tiles by land centroid")
+        # Better fallback: use land centroid to find the correct MGRS tile
+        land_shape = shape(geometry)
+        centroid = land_shape.centroid
+        lon, lat = centroid.x, centroid.y
+        
+        # Get tiles that might contain this point (with generous buffer)
         tiles = supabase.table("satellite_tiles").select("*").execute().data or []
-        g_land = shape(geometry)
-        return [t for t in tiles if g_land.intersects(shape(t.get("bbox") or t.get("geometry")))]
+        
+        # Filter by centroid proximity first (much more accurate)
+        candidates = []
+        for tile in tiles:
+            bbox_data = tile.get("bbox")
+            if not bbox_data:
+                continue
+            
+            # Parse bbox
+            if isinstance(bbox_data, str):
+                bbox_data = json.loads(bbox_data)
+            
+            if bbox_data.get("type") == "Polygon":
+                coords = bbox_data["coordinates"][0]
+                min_lon = min(c[0] for c in coords)
+                max_lon = max(c[0] for c in coords)
+                min_lat = min(c[1] for c in coords)
+                max_lat = max(c[1] for c in coords)
+                
+                # Check if land centroid is within tile bounds (with small buffer)
+                buffer = 0.01  # ~1km buffer
+                if (min_lon - buffer <= lon <= max_lon + buffer and
+                    min_lat - buffer <= lat <= max_lat + buffer):
+                    candidates.append(tile)
+                    logger.info(f"🎯 Found candidate tile: {tile['tile_id']} for point ({lon:.5f}, {lat:.5f})")
+        
+        return candidates if candidates else tiles[:2]  # Fallback to first 2 tiles if nothing found
 
 def load_ndvi_from_tiles(tile_list: List[dict], land_geom: dict) -> np.ndarray:
     """Load and merge NDVI rasters for all intersecting tiles with CRS handling."""
