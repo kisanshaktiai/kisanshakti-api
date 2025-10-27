@@ -1,317 +1,544 @@
 """
-NDVI Land API v5.0 - Production-Ready Multi-Tenant NDVI Processing API
-======================================================================
-Architecture:
-- Handles NDVI processing requests from tenant portals
-- Manages queue for batch processing
-- Provides real-time status monitoring
-- Integrates with B2 cloud storage and Supabase
-- Supports instant and queued processing modes
+NDVI Land Processing API
+========================
+REST API endpoint for processing NDVI data for agricultural lands.
+Handles multi-tenant authentication, validation, and async task queuing.
 
-Features:
-✅ Multi-tenant isolation
-✅ Geographic tile intersection detection
-✅ Batch processing with priority queuing
-✅ Real-time progress tracking
-✅ Comprehensive error handling & logging
-✅ RESTful API with OpenAPI docs
+Author: KisanShakti Team
+Version: 1.0.0
 """
 
 import os
 import logging
-import datetime
-from typing import List, Optional, Dict, Any
-from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, validator
-import uvicorn
-
+import jwt
 from supabase import create_client, Client
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
-# =============================================================================
+from ndvi_land_worker import NDVILandWorker
+
+# ============================================================================
 # Configuration & Logging
-# =============================================================================
+# ============================================================================
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("ndvi-api")
+logger = logging.getLogger(__name__)
 
 # Environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-B2_APP_KEY_ID = os.getenv("B2_APP_KEY_ID")
-B2_APP_KEY = os.getenv("B2_APP_KEY")
-B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME", "kisanshakti-ndvi-tiles")
-RENDER_SERVICE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://ndvi-land-api.onrender.com")
+JWT_SECRET = os.getenv("JWT_SECRET", "your-jwt-secret-change-in-production")
+MAX_WORKERS = int(os.getenv("LAND_WORKER_CONCURRENCY", "8"))
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    logger.critical("❌ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
-    raise RuntimeError("Critical environment variables missing")
-
-# Initialize Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-logger.info(f"✅ Supabase client initialized: {SUPABASE_URL}")
-
-# =============================================================================
-# Pydantic Models
-# =============================================================================
-class NDVIRequestCreate(BaseModel):
-    """Request model for creating NDVI processing job"""
-    land_ids: List[str] = Field(..., min_items=1, description="List of land UUIDs to process")
-    tile_id: Optional[str] = Field(None, description="Optional specific tile ID (auto-detected if not provided)")
-    instant: bool = Field(False, description="Process immediately (true) or queue for batch (false)")
-    statistics_only: bool = Field(False, description="Only compute statistics, skip thumbnail generation")
-    priority: int = Field(5, ge=1, le=10, description="Priority (1=highest, 10=lowest)")
-    farmer_id: Optional[str] = Field(None, description="Optional farmer ID for filtering")
-    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional metadata")
-
-    @validator("land_ids")
-    def validate_land_ids(cls, v):
-        if not v:
-            raise ValueError("At least one land_id is required")
-        return v
-
-
-class NDVIRequestResponse(BaseModel):
-    """Response model for NDVI request creation"""
-    success: bool
-    message: str
-    queue_id: str
-    tenant_id: str
-    status: str
-    land_count: int
-    estimated_completion: Optional[str] = None
-    instant_result: Optional[Dict[str, Any]] = None
-
-
-class QueueStatusResponse(BaseModel):
-    """Response model for queue status"""
-    success: bool
-    tenant_id: str
-    total: int
-    queued: int
-    processing: int
-    completed: int
-    failed: int
-    queue_items: List[Dict[str, Any]]
-
-
-class HealthCheckResponse(BaseModel):
-    """Health check response"""
-    status: str
-    service: str
-    version: str
-    timestamp: str
-    supabase_connected: bool
-    b2_configured: bool
-
-
-# =============================================================================
-# Helpers
-# =============================================================================
-def now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
-
-
-async def get_intersecting_tiles(tenant_id: str, land_ids: List[str]) -> List[str]:
-    """Find intersecting MGRS tiles for given lands"""
-    try:
-        lands_response = supabase.table("lands").select(
-            "id, boundary_polygon_old, boundary, center_lat, center_lon"
-        ).eq("tenant_id", tenant_id).in_("id", land_ids).execute()
-
-        if not lands_response.data:
-            raise ValueError(f"No lands found for tenant {tenant_id}")
-
-        try:
-            tiles_response = supabase.rpc(
-                "get_intersecting_tiles_for_lands",
-                {"p_tenant_id": tenant_id, "p_land_ids": land_ids},
-            ).execute()
-            if tiles_response.data:
-                tile_ids = [t["tile_id"] for t in tiles_response.data]
-                return list(set(tile_ids))
-        except Exception:
-            pass
-
-        tile_ids = set()
-        for land in lands_response.data:
-            if land.get("center_lat") and land.get("center_lon"):
-                tile_response = (
-                    supabase.table("mgrs_tiles")
-                    .select("tile_id")
-                    .limit(1)
-                    .execute()
-                )
-                if tile_response.data:
-                    tile_ids.add(tile_response.data[0]["tile_id"])
-
-        if not tile_ids:
-            tile_ids.add("43RGN")
-
-        return list(tile_ids)
-    except Exception as e:
-        logger.error(f"Error finding intersecting tiles: {e}")
-        return ["43RGN"]
-
-
-async def create_queue_entry(
-    tenant_id: str,
-    land_ids: List[str],
-    tile_ids: List[str],
-    priority: int,
-    statistics_only: bool,
-    farmer_id: Optional[str],
-    metadata: Dict[str, Any],
-) -> str:
-    """Insert a new NDVI processing request into the queue"""
-    primary_tile = tile_ids[0] if tile_ids else "43RGN"
-    queue_entry = {
-        "tenant_id": tenant_id,
-        "land_ids": land_ids,
-        "tile_id": primary_tile,
-        "priority": priority,
-        "statistics_only": statistics_only,
-        "farmer_id": farmer_id,
-        "status": "queued",
-        "requested_at": now_iso(),
-        "created_at": now_iso(),
-        "metadata": {**metadata, "all_tiles": tile_ids, "api_version": "5.0"},
-    }
-
-    response = supabase.table("ndvi_request_queue").insert(queue_entry).execute()
-    if not response.data:
-        raise HTTPException(status_code=500, detail="Failed to create queue entry")
-
-    queue_id = response.data[0]["id"]
-    logger.info(f"✅ Queue entry created: {queue_id} | lands={len(land_ids)}")
-    return queue_id
-
-
-# =============================================================================
-# FastAPI App Setup
-# =============================================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 NDVI Land API starting...")
-    yield
-    logger.info("🛑 NDVI Land API shutting down...")
-
+# Initialize FastAPI app
 app = FastAPI(
     title="NDVI Land Processing API",
-    version="5.0.0",
-    description="Multi-tenant NDVI analysis API",
-    lifespan=lifespan,
+    description="Multi-tenant NDVI processing service for agricultural lands",
+    version="1.0.0"
 )
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Configure appropriately for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Thread pool for background tasks
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# =============================================================================
-# API Routes
-# =============================================================================
-@app.get("/api/v1/health", response_model=HealthCheckResponse)
-async def health_check():
-    """Basic health check"""
-    try:
-        test_response = supabase.table("mgrs_tiles").select("tile_id").limit(1).execute()
-        supabase_ok = bool(test_response.data)
-    except Exception:
-        supabase_ok = False
-    return {
-        "status": "healthy" if supabase_ok else "degraded",
-        "service": "ndvi-land-api",
-        "version": "5.0.0",
-        "timestamp": now_iso(),
-        "supabase_connected": supabase_ok,
-        "b2_configured": bool(B2_APP_KEY_ID and B2_APP_KEY),
+# Security
+security = HTTPBearer()
+
+# ============================================================================
+# Request/Response Models
+# ============================================================================
+
+class NDVIProcessRequest(BaseModel):
+    """Request model for NDVI processing."""
+    land_id: str = Field(..., description="UUID of the land to process")
+    lookback_days: int = Field(
+        default=15,
+        ge=1,
+        le=90,
+        description="Number of days to look back for satellite imagery"
+    )
+    max_cloud_cover: float = Field(
+        default=20.0,
+        ge=0.0,
+        le=100.0,
+        description="Maximum acceptable cloud cover percentage"
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="Force re-processing even if recent data exists"
+    )
+
+    @validator('land_id')
+    def validate_uuid(cls, v):
+        try:
+            UUID(v)
+        except ValueError:
+            raise ValueError('land_id must be a valid UUID')
+        return v
+
+
+class NDVIStatistics(BaseModel):
+    """NDVI statistics for a land."""
+    min_ndvi: Optional[float] = Field(None, ge=-1.0, le=1.0)
+    max_ndvi: Optional[float] = Field(None, ge=-1.0, le=1.0)
+    mean_ndvi: Optional[float] = Field(None, ge=-1.0, le=1.0)
+    median_ndvi: Optional[float] = Field(None, ge=-1.0, le=1.0)
+    std_ndvi: Optional[float] = Field(None, ge=0.0)
+    valid_pixels: Optional[int] = Field(None, ge=0)
+    total_pixels: Optional[int] = Field(None, ge=0)
+    coverage_percentage: Optional[float] = Field(None, ge=0.0, le=100.0)
+
+
+class MicroTileInfo(BaseModel):
+    """Information about a generated micro-tile."""
+    tile_id: str
+    acquisition_date: str
+    thumbnail_url: Optional[str]
+    overlay_url: Optional[str]
+    bbox: Dict[str, Any]
+    ndvi_stats: NDVIStatistics
+
+
+class NDVIProcessResponse(BaseModel):
+    """Response model for NDVI processing."""
+    success: bool
+    message: str
+    land_id: str
+    tenant_id: str
+    processed_at: str
+    overall_stats: Optional[NDVIStatistics]
+    micro_tiles: list[MicroTileInfo]
+    overlay_geojson: Optional[Dict[str, Any]]
+    processing_time_seconds: Optional[float]
+
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+    status: str
+    timestamp: str
+    version: str
+
+
+# ============================================================================
+# Dependencies
+# ============================================================================
+
+def get_supabase_client() -> Client:
+    """Get Supabase client instance."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Supabase configuration missing"
+        )
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+async def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> Dict[str, Any]:
+    """
+    Verify JWT token and extract tenant/user information.
+    
+    Expected JWT payload:
+    {
+        "tenant_id": "uuid",
+        "user_id": "uuid",
+        "role": "admin|user",
+        "exp": timestamp
     }
-
-
-@app.post("/api/v1/ndvi/lands/analyze", response_model=NDVIRequestResponse)
-async def create_ndvi_request(
-    request: NDVIRequestCreate,
-    tenant_id: str = Query(...),
-):
-    """Create a new NDVI processing request"""
+    """
+    token = credentials.credentials
+    
     try:
-        logger.info(f"📥 NDVI request: tenant={tenant_id}, lands={len(request.land_ids)}, instant={request.instant}")
-
-        lands_check = (
-            supabase.table("lands")
-            .select("id")
-            .eq("tenant_id", tenant_id)
-            .in_("id", request.land_ids)
-            .execute()
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        
+        if "tenant_id" not in payload:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token: missing tenant_id"
+            )
+        
+        # Check expiration
+        if datetime.utcnow().timestamp() > payload.get("exp", 0):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token expired"
+            )
+        
+        return payload
+    
+    except jwt.InvalidTokenError as e:
+        logger.error(f"Token validation error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token"
         )
-        if not lands_check.data:
-            raise HTTPException(status_code=403, detail="Invalid land IDs for tenant")
 
-        tile_ids = [request.tile_id] if request.tile_id else await get_intersecting_tiles(tenant_id, request.land_ids)
-        queue_id = await create_queue_entry(
-            tenant_id, request.land_ids, tile_ids, request.priority, request.statistics_only, request.farmer_id, request.metadata
+
+async def validate_land_access(
+    land_id: str,
+    tenant_id: str,
+    supabase: Client
+) -> Dict[str, Any]:
+    """
+    Validate that the land exists and belongs to the requesting tenant.
+    
+    Args:
+        land_id: UUID of the land
+        tenant_id: UUID of the tenant making the request
+        supabase: Supabase client
+    
+    Returns:
+        Land record from database
+    
+    Raises:
+        HTTPException: If land not found or access denied
+    """
+    try:
+        response = supabase.table("lands").select(
+            "id, tenant_id, farmer_id, name, area_acres, boundary, "
+            "center_lat, center_lon, current_crop, is_active"
+        ).eq("id", land_id).eq("tenant_id", tenant_id).execute()
+        
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Land {land_id} not found or access denied"
+            )
+        
+        land = response.data[0]
+        
+        # Check if land is active
+        if not land.get("is_active", True):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Land is not active"
+            )
+        
+        # Validate boundary exists
+        if not land.get("boundary"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Land boundary not defined. Please add boundary coordinates first."
+            )
+        
+        return land
+    
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logger.error(f"Error validating land access: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to validate land access"
         )
 
-        instant_result = None
-        final_status = "queued"
 
-        # ⚡ Instant processing mode
-        if request.instant:
-            try:
-                logger.info(f"⚡ Triggering instant NDVI processing for queue_id={queue_id}")
-                from ndvi_land_worker import process_request_async
-                worker_result = await process_request_async(queue_id, tenant_id, request.land_ids, tile_ids)
-                instant_result = worker_result
-                final_status = "completed" if worker_result.get("processed_count", 0) > 0 else "failed"
+# ============================================================================
+# API Endpoints
+# ============================================================================
 
-                supabase.table("ndvi_request_queue").update({
-                    "status": final_status,
-                    "processed_count": worker_result.get("processed_count", 0),
-                    "failed_count": worker_result.get("failed_count", 0),
-                    "completed_at": now_iso(),
-                }).eq("id", queue_id).execute()
-            except Exception as e:
-                logger.exception("Instant processing failed")
-                supabase.table("ndvi_request_queue").update({
-                    "status": "failed",
-                    "last_error": str(e),
-                }).eq("id", queue_id).execute()
-                final_status = "failed"
-                instant_result = {"error": str(e)}
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint."""
+    return HealthResponse(
+        status="healthy",
+        timestamp=datetime.utcnow().isoformat(),
+        version="1.0.0"
+    )
 
-        eta_time = datetime.datetime.utcnow() + datetime.timedelta(seconds=len(request.land_ids) * 2)
-        return NDVIRequestResponse(
+
+@app.post("/api/v1/ndvi/process", response_model=NDVIProcessResponse)
+async def process_land_ndvi(
+    request: NDVIProcessRequest,
+    background_tasks: BackgroundTasks,
+    auth_payload: Dict[str, Any] = Depends(verify_token),
+    supabase: Client = Depends(get_supabase_client)
+):
+    """
+    Process NDVI data for a specific land parcel.
+    
+    This endpoint:
+    1. Validates tenant access to the land
+    2. Discovers/downloads satellite imagery
+    3. Computes NDVI for the land polygon
+    4. Generates colorized overlay and thumbnails
+    5. Stores results in database and storage
+    
+    Args:
+        request: NDVI processing parameters
+        auth_payload: Authenticated user/tenant info
+        supabase: Supabase client
+    
+    Returns:
+        NDVIProcessResponse with statistics and overlay URLs
+    """
+    start_time = datetime.utcnow()
+    tenant_id = auth_payload["tenant_id"]
+    user_id = auth_payload.get("user_id")
+    
+    logger.info(
+        f"NDVI processing request - Land: {request.land_id}, "
+        f"Tenant: {tenant_id}, User: {user_id}"
+    )
+    
+    try:
+        # Validate land access
+        land = await validate_land_access(request.land_id, tenant_id, supabase)
+        
+        # Check if recent processing exists and force_refresh is False
+        if not request.force_refresh:
+            recent_data = supabase.table("ndvi_data").select(
+                "date, ndvi_value, mean_ndvi, min_ndvi, max_ndvi"
+            ).eq("land_id", request.land_id).order(
+                "date", desc=True
+            ).limit(1).execute()
+            
+            if recent_data.data:
+                latest = recent_data.data[0]
+                latest_date = datetime.fromisoformat(latest["date"])
+                days_old = (datetime.utcnow() - latest_date).days
+                
+                if days_old < 7:  # Data less than 7 days old
+                    logger.info(
+                        f"Recent NDVI data exists ({days_old} days old). "
+                        "Use force_refresh=true to reprocess."
+                    )
+                    # Return existing data
+                    return await _fetch_existing_ndvi_data(
+                        request.land_id, tenant_id, supabase
+                    )
+        
+        # Initialize worker
+        worker = NDVILandWorker(
+            supabase_url=SUPABASE_URL,
+            supabase_key=SUPABASE_SERVICE_ROLE_KEY,
+            b2_key_id=os.getenv("B2_KEY_ID"),
+            b2_app_key=os.getenv("B2_APP_KEY"),
+            b2_bucket=os.getenv("B2_BUCKET_RAW"),
+            mpc_stac_url=os.getenv("MPC_STAC_BASE")
+        )
+        
+        # Process NDVI (synchronous operation)
+        logger.info(f"Starting NDVI processing for land {request.land_id}")
+        result = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            worker.process_land_ndvi,
+            request.land_id,
+            tenant_id,
+            request.lookback_days,
+            request.max_cloud_cover
+        )
+        
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        logger.info(
+            f"NDVI processing completed for land {request.land_id} "
+            f"in {processing_time:.2f}s"
+        )
+        
+        # Build response
+        response = NDVIProcessResponse(
             success=True,
-            message="NDVI request processed successfully" if request.instant else "NDVI request queued successfully",
-            queue_id=queue_id,
+            message="NDVI processing completed successfully",
+            land_id=request.land_id,
             tenant_id=tenant_id,
-            status=final_status,
-            land_count=len(request.land_ids),
-            estimated_completion=None if request.instant else eta_time.isoformat(),
-            instant_result=instant_result,
+            processed_at=datetime.utcnow().isoformat(),
+            overall_stats=NDVIStatistics(**result["overall_stats"]),
+            micro_tiles=[
+                MicroTileInfo(
+                    tile_id=mt["tile_id"],
+                    acquisition_date=mt["acquisition_date"],
+                    thumbnail_url=mt.get("thumbnail_url"),
+                    overlay_url=mt.get("overlay_url"),
+                    bbox=mt["bbox"],
+                    ndvi_stats=NDVIStatistics(**mt["ndvi_stats"])
+                )
+                for mt in result["micro_tiles"]
+            ],
+            overlay_geojson=result.get("overlay_geojson"),
+            processing_time_seconds=processing_time
         )
-
+        
+        return response
+    
     except HTTPException:
         raise
+    
     except Exception as e:
-        logger.exception("Failed to create NDVI request")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"NDVI processing failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"NDVI processing failed: {str(e)}"
+        )
 
 
-# =============================================================================
-# Main Entry
-# =============================================================================
+@app.get("/api/v1/ndvi/status/{land_id}", response_model=NDVIProcessResponse)
+async def get_ndvi_status(
+    land_id: str,
+    auth_payload: Dict[str, Any] = Depends(verify_token),
+    supabase: Client = Depends(get_supabase_client)
+):
+    """
+    Get the latest NDVI processing status and data for a land.
+    
+    Args:
+        land_id: UUID of the land
+        auth_payload: Authenticated user/tenant info
+        supabase: Supabase client
+    
+    Returns:
+        Latest NDVI data for the land
+    """
+    tenant_id = auth_payload["tenant_id"]
+    
+    try:
+        # Validate access
+        await validate_land_access(land_id, tenant_id, supabase)
+        
+        # Fetch existing data
+        return await _fetch_existing_ndvi_data(land_id, tenant_id, supabase)
+    
+    except HTTPException:
+        raise
+    
+    except Exception as e:
+        logger.error(f"Failed to fetch NDVI status: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch NDVI status: {str(e)}"
+        )
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+async def _fetch_existing_ndvi_data(
+    land_id: str,
+    tenant_id: str,
+    supabase: Client
+) -> NDVIProcessResponse:
+    """Fetch existing NDVI data from database."""
+    
+    # Get latest NDVI data
+    ndvi_response = supabase.table("ndvi_data").select("*").eq(
+        "land_id", land_id
+    ).order("date", desc=True).limit(10).execute()
+    
+    # Get micro tiles
+    tiles_response = supabase.table("ndvi_micro_tiles").select("*").eq(
+        "land_id", land_id
+    ).order("acquisition_date", desc=True).limit(10).execute()
+    
+    if not ndvi_response.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No NDVI data found for this land"
+        )
+    
+    # Calculate overall stats from latest data
+    latest = ndvi_response.data[0]
+    overall_stats = NDVIStatistics(
+        min_ndvi=latest.get("min_ndvi") or latest.get("ndvi_min"),
+        max_ndvi=latest.get("max_ndvi") or latest.get("ndvi_max"),
+        mean_ndvi=latest.get("mean_ndvi"),
+        median_ndvi=None,  # Not stored in this schema
+        std_ndvi=latest.get("ndvi_std"),
+        valid_pixels=latest.get("valid_pixels"),
+        total_pixels=latest.get("total_pixels"),
+        coverage_percentage=latest.get("coverage_percentage")
+    )
+    
+    # Build micro tiles list
+    micro_tiles = []
+    for tile in tiles_response.data:
+        micro_tiles.append(MicroTileInfo(
+            tile_id=tile.get("id"),
+            acquisition_date=tile["acquisition_date"],
+            thumbnail_url=tile.get("ndvi_thumbnail_url"),
+            overlay_url=tile.get("ndvi_thumbnail_url"),  # Same as thumbnail for now
+            bbox=tile.get("bbox", {}),
+            ndvi_stats=NDVIStatistics(
+                min_ndvi=tile.get("ndvi_min"),
+                max_ndvi=tile.get("ndvi_max"),
+                mean_ndvi=tile.get("ndvi_mean"),
+                median_ndvi=None,
+                std_ndvi=tile.get("ndvi_std_dev"),
+                valid_pixels=None,
+                total_pixels=None,
+                coverage_percentage=None
+            )
+        ))
+    
+    return NDVIProcessResponse(
+        success=True,
+        message="Existing NDVI data retrieved",
+        land_id=land_id,
+        tenant_id=tenant_id,
+        processed_at=latest.get("computed_at") or latest.get("created_at"),
+        overall_stats=overall_stats,
+        micro_tiles=micro_tiles,
+        overlay_geojson=None,
+        processing_time_seconds=None
+    )
+
+
+# ============================================================================
+# Application Startup/Shutdown
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup."""
+    logger.info("Starting NDVI Land Processing API...")
+    logger.info(f"Max worker threads: {MAX_WORKERS}")
+    
+    # Verify Supabase connection
+    try:
+        supabase = get_supabase_client()
+        logger.info("✓ Supabase connection verified")
+    except Exception as e:
+        logger.error(f"✗ Failed to connect to Supabase: {e}")
+    
+    logger.info("API ready to accept requests")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown."""
+    logger.info("Shutting down NDVI Land Processing API...")
+    executor.shutdown(wait=True)
+    logger.info("Shutdown complete")
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    uvicorn.run("ndvi_land_api:app", host="0.0.0.0", port=port, reload=False)
+    import uvicorn
+    
+    port = int(os.getenv("PORT", "8000"))
+    
+    uvicorn.run(
+        "ndvi_land_api:app",
+        host="0.0.0.0",
+        port=port,
+        reload=os.getenv("ENV") == "development",
+        log_level=os.getenv("LOG_LEVEL", "info").lower()
+    )
