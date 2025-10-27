@@ -239,19 +239,52 @@ def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Option
     from shapely.ops import transform as _transform
 
     def _reproject_geom_to_raster(geom, raster_crs):
-        """Ensure land geometry matches raster CRS (EPSG:4326 → target CRS)."""
+    """
+    Safely reproject land geometry from EPSG:4326 → raster CRS.
+    Always returns a valid GeoJSON dict (never string).
+    """
+    try:
+        # Ensure we always have a GeoJSON dict, not string
+        if isinstance(geom, str):
+            try:
+                geom_dict = json.loads(geom)
+            except json.JSONDecodeError:
+                logger.warning("⚠️ Geometry string was not valid JSON; using raw input")
+                geom_dict = geom
+        elif isinstance(geom, dict):
+            geom_dict = geom
+        else:
+            raise ValueError("Unsupported geometry type for reprojection")
+
+        geom_shape = shape(geom_dict)
+
+        # Determine raster CRS string
+        raster_crs_str = None
+        if raster_crs:
+            try:
+                raster_crs_str = raster_crs.to_string()
+            except Exception:
+                raster_crs_str = str(raster_crs)
+
+        # Reproject if necessary
+        if raster_crs_str and raster_crs_str != "EPSG:4326":
+            import pyproj
+            from shapely.ops import transform
+            transformer = pyproj.Transformer.from_crs("EPSG:4326", raster_crs_str, always_xy=True).transform
+            geom_shape = transform(transformer, geom_shape)
+            logger.debug(f"🧭 Reprojected land geometry to {raster_crs_str}")
+
+        # ✅ Always return a pure dict (never string)
+        return json.loads(json.dumps(geom_shape.__geo_interface__))
+
+    except Exception as e:
+        logger.warning(f"⚠️ Reprojection failed: {e}")
         try:
-            geom_shape = shape(geom)
-            # raster_crs may be a CRS object or None
-            raster_crs_str = raster_crs.to_string() if raster_crs else "EPSG:4326"
-            if raster_crs_str and raster_crs_str != "EPSG:4326":
-                project = pyproj.Transformer.from_crs("EPSG:4326", raster_crs_str, always_xy=True).transform
-                geom_shape = _transform(project, geom_shape)
-                logger.debug(f"🧭 Reprojected land geometry to {raster_crs_str}")
-            return _mapping(geom_shape)
-        except Exception as e:
-            logger.warning(f"⚠️ Reprojection failed: {e}")
+            # Return as dict if recoverable
+            return geom if isinstance(geom, dict) else json.loads(geom)
+        except Exception:
             return geom
+
 
     # Step 1: Try precomputed NDVI COG
     try:
