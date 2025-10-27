@@ -238,7 +238,7 @@ def stream_ndvi_blocking(tile_id: str, acq_date: str, land_geom: dict) -> Option
     import pyproj
     from shapely.ops import transform as _transform
 
-        def _reproject_geom_to_raster(geom, raster_crs):
+    def _reproject_geom_to_raster(geom, raster_crs):
             """
             Safely reproject land geometry from EPSG:4326 → raster CRS.
             Always returns a valid GeoJSON dict (never string).
