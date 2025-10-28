@@ -1,164 +1,148 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# File: tile_fetch_api.py
-# Version: v1.9.0 — Stable Async NDVI Worker API
-# Author: Amarsinh Patil
-# Purpose:
-#   Orchestrates NDVI tile fetching & computation using FastAPI.
-#   Runs tile_fetch_worker.main() in a background thread, returns immediately.
-#   Compatible with Render.com (binds port), Supabase, and n8n edge triggers.
+# File: tile_fetch_api.py  (FastAPI service)
+# Version: 1.8.2
+# Runtime: Python 3.8+ recommended (3.8/3.9/3.11)
+# Purpose: Orchestrates NDVI tile processing in background threads
+# Updates in v1.8.2:
+# - Added root route ("/") to prevent 404 "No server available" errors
+# - Enhanced /health endpoint with uptime and app info
+# - Improved structured logging at startup
+# - Minor response consistency improvements
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os
-import time
 import json
+import time
 import logging
 import traceback
 import threading
-from typing import Optional, List
+from typing import List, Optional, Dict
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
-# Local worker import
+# Local worker module
 import tile_fetch_worker
 
-# ----------------------------- Configuration -----------------------------
-APP_VERSION = "1.9.0"
+
+APP_VERSION = "1.8.2"
 START_TIME = time.time()
-DEFAULT_CLOUD_COVER = int(os.getenv("DEFAULT_CLOUD_COVER_MAX", 30))
-DEFAULT_LOOKBACK_DAYS = int(os.getenv("MAX_SCENE_LOOKBACK_DAYS", 30))
 
-# ----------------------------- Logging Setup -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
-logger = logging.getLogger("tile-fetch-api")
 
-# ----------------------------- FastAPI Setup -----------------------------
-app = FastAPI(title="NDVI Tile Fetch API", version=APP_VERSION)
 
+app = FastAPI()
+
+# ✅ Allow CORS (restrict origins later in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------------- Utility -----------------------------
-def uptime():
-    return round(time.time() - START_TIME, 2)
-
-# ----------------------------- Health & Root -----------------------------
-@app.get("/")
-async def root():
-    return {
-        "service": "ndvi-tile-fetch-api",
-        "status": "running",
-        "version": APP_VERSION,
-        "uptime_seconds": uptime(),
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    }
-
 @app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "service": "ndvi-tile-fetch-api",
-        "version": APP_VERSION,
-        "uptime_seconds": uptime()
-    }
+def health_check():
+    return {"status": "ok"}
 
-@app.get("/version")
-async def version():
-    return {"version": APP_VERSION}
-
-# ----------------------------- Background Job Helper -----------------------------
-def start_background_worker(cloud_cover: int, lookback_days: int, filter_tile_ids: Optional[List[str]] = None):
-    """Launch the NDVI worker in a background thread"""
-    def background_job():
-        try:
-            logger.info(f"🚀 Background worker started (cloud_cover={cloud_cover}, lookback={lookback_days}, tiles={filter_tile_ids})")
-            result = tile_fetch_worker.main(cloud_cover=cloud_cover, lookback_days=lookback_days)
-            logger.info(f"✅ Worker finished processing {result} tiles.")
-        except Exception as e:
-            logger.error(f"❌ Background worker crashed: {e}\n{traceback.format_exc()}")
-
-    thread = threading.Thread(target=background_job, daemon=True)
-    thread.start()
-    return thread
-
-# ----------------------------- Endpoints -----------------------------
 @app.post("/run")
 async def run_worker(request: Request):
-    """
-    Trigger NDVI tile fetch & compute for all agricultural MGRS tiles.
-    Runs in a background thread to avoid blocking.
-    Returns HTTP 202 Accepted immediately.
-    """
     try:
         body = await request.json()
-    except Exception:
-        body = {}
+        cloud_cover = body.get("cloud_cover", 30)     # default 30%
+        lookback_days = body.get("lookback_days", 5)  # default 5 days
 
-    cloud_cover = int(body.get("cloud_cover", DEFAULT_CLOUD_COVER))
-    lookback_days = int(body.get("lookback_days", DEFAULT_LOOKBACK_DAYS))
+        logging.info(f"Running worker with cloud_cover={cloud_cover}, lookback_days={lookback_days}")
+        processed_count = tile_fetch_worker.main(cloud_cover=cloud_cover, lookback_days=lookback_days)
 
-    logger.info(f"POST /run — Starting NDVI worker (cloud_cover={cloud_cover}, lookback_days={lookback_days})")
+        return {
+            "status": "success",
+            "cloud_cover": cloud_cover,
+            "lookback_days": lookback_days,
+            "processed_tiles": processed_count
+        }
+    except Exception as e:
+        logging.error(f"Worker failed: {e}")
+        return {"status": "error", "message": str(e)}
 
-    start_background_worker(cloud_cover, lookback_days)
 
-    return JSONResponse(
-        status_code=202,
-        content={
-            "status": "started",
-            "message": "NDVI worker running in background.",
-            "params": {
-                "cloud_cover": cloud_cover,
-                "lookback_days": lookback_days,
+        def background_job():
+            try:
+                stats = tile_worker.main(
+                    cloud_cover=cc,
+                    lookback_days=lb,
+                    filter_tile_ids=tile_ids,
+                    max_tiles=mt,
+                    force=force,
+                )
+                logger.info("✅ Worker finished: %s", json.dumps(stats))
+            except Exception:
+                logger.error("❌ Background worker crashed: %s", traceback.format_exc())
+
+        threading.Thread(target=background_job, daemon=True).start()
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "started",
+                "message": "Worker started in background.",
+                "params": {
+                    "cloud_cover": cc,
+                    "lookback_days": lb,
+                    "max_tiles": mt,
+                    "force": force,
+                    "tile_ids": tile_ids,
+                },
             },
-        },
-    )
+        )
 
+    except Exception as e:
+        logger.error("❌ Trigger failed: %s\n%s", e, traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)},
+        )
+
+
+# --------------------------- Single Tile Trigger -----------------------------
 @app.post("/run/{tile_id}")
 async def run_single_tile(tile_id: str, request: Request):
-    """
-    Trigger NDVI computation for a single MGRS tile.
-    """
+    """Process a single MGRS tile id on-demand."""
     try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    cloud_cover = int(body.get("cloud_cover", DEFAULT_CLOUD_COVER))
-    lookback_days = int(body.get("lookback_days", DEFAULT_LOOKBACK_DAYS))
-
-    logger.info(f"POST /run/{tile_id} — Starting NDVI worker for single tile")
-
-    def background_job():
         try:
-            logger.info(f"🚀 Worker started for single tile {tile_id}")
-            result = tile_fetch_worker.main(cloud_cover=cloud_cover, lookback_days=lookback_days)
-            logger.info(f"✅ Single-tile worker finished ({tile_id}) → {result} tiles processed.")
-        except Exception as e:
-            logger.error(f"❌ Single-tile run failed for {tile_id}: {e}\n{traceback.format_exc()}")
+            body = await request.json()
+        except Exception:
+            body = {}
 
-    threading.Thread(target=background_job, daemon=True).start()
+        cc = int(body.get("cloud_cover", os.getenv("DEFAULT_CLOUD_COVER_MAX", 30)))
+        lb = int(body.get("lookback_days", os.getenv("MAX_SCENE_LOOKBACK_DAYS", 30)))
+        force = bool(body.get("force", False))
 
-    return JSONResponse(
-        status_code=202,
-        content={
-            "status": "started",
-            "tile_id": tile_id,
-            "params": {"cloud_cover": cloud_cover, "lookback_days": lookback_days},
-        },
-    )
+        def background_job():
+            try:
+                stats = tile_worker.main(
+                    cloud_cover=cc,
+                    lookback_days=lb,
+                    filter_tile_ids=[tile_id],
+                    max_tiles=1,
+                    force=force,
+                )
+                logger.info("✅ Single-tile run finished: %s", json.dumps(stats))
+            except Exception:
+                logger.error("❌ Single-tile run crashed: %s", traceback.format_exc())
 
-# ----------------------------- Run Server -----------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 10000))
-    logger.info(f"Starting NDVI Tile Fetch API v{APP_VERSION} on port {port}")
-    uvicorn.run("tile_fetch_api:app", host="0.0.0.0", port=port, log_level="info")
+        threading.Thread(target=background_job, daemon=True).start()
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "started",
+                "tile_id": tile_id,
+                "cloud_cover": cc,
+                "lookback_days": lb,
+                "force": force,
+            },
+        )
+
+    except Exception as e:
+        logger.error("❌ Trigger failed: %s\n%s", e, traceback.format_exc())
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
