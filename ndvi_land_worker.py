@@ -258,7 +258,12 @@ async def process_single_land_async(land: Dict, tile_ids: Optional[List[str]], a
 # ---------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------
-async def process_request_async(queue_id: str, tenant_id: str, land_ids: List[str]):
+async def process_request_async(
+    queue_id: str,
+    tenant_id: str,
+    land_ids: List[str],
+    tile_ids: Optional[List[str]] = None
+):
     logger.info(f"🚀 Processing queue {queue_id} for {len(land_ids)} lands")
     resp = supabase.table("lands").select("*").eq("tenant_id", tenant_id).in_("id", land_ids).execute()
     lands = resp.data or []
