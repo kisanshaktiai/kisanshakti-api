@@ -1,33 +1,36 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# File: tile_fetch_worker_v4.2.0.py
-# Version: v4.2.0 Reflectance-Scaled Stable (Hybrid: full NDVI + bbox_geom)
+# File: tile_fetch_worker_v4.3.0.py
+# Version: v4.3.0 (Stable Reflectance-Scaled + Network Hardened)
 # Author: Amarsinh Patil
-# Date: 2025-10-29
+# Date: 2025-10-30
 # Purpose:
-# Sentinel-2 NDVI tile processor for agricultural zones.
-# Downloads RED/NIR bands from Microsoft Planetary Computer (MPC),
-# compresses as COG, computes NDVI (with proper reflectance scaling),
-# uploads to Backblaze B2, and updates Supabase satellite_tiles
-# table with statistics plus geometry (bbox JSON + bbox_geom SRID=4326).
+# Sentinel-2 NDVI tile processor for agricultural zones with improved
+# SSL handling, network resilience, and caching of signed URLs.
 # ──────────────────────────────────────────────────────────────────────────────
+
 #!/usr/bin/env python3
 import os
-import requests
 import json
 import datetime
 import tempfile
 import logging
 import traceback
-
-from supabase import create_client
-from b2sdk.v2 import InMemoryAccountInfo, B2Api
-from requests.adapters import HTTPAdapter, Retry
+import numpy as np
+import certifi
+from cachetools import TTLCache
 from shapely import wkb, wkt
 from shapely.geometry import mapping, shape
-import planetary_computer as pc
+
 import rasterio
 from rasterio.windows import Window
-import numpy as np
+import planetary_computer as pc
+from pystac_client import Client
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+from supabase import create_client
+from b2sdk.v2 import InMemoryAccountInfo, B2Api
 
 # ---------------- Config ----------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -38,18 +41,14 @@ B2_APP_KEY = os.environ.get("B2_APP_KEY")
 B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "kisanshakti-ndvi-tiles")
 B2_PREFIX = os.environ.get("B2_PREFIX", "tiles/")
 
-MPC_STAC = os.environ.get("MPC_STAC_BASE", "https://planetarycomputer.microsoft.com/api/stac/v1/search")
+MPC_STAC = os.environ.get("MPC_STAC_BASE", "https://planetarycomputer.microsoft.com/api/stac/v1")
 MPC_COLLECTION = os.environ.get("MPC_COLLECTION", "sentinel-2-l2a")
+
 CLOUD_COVER = int(os.environ.get("DEFAULT_CLOUD_COVER_MAX", "20"))
 LOOKBACK_DAYS = int(os.environ.get("MAX_SCENE_LOOKBACK_DAYS", "5"))
 
-# Memory optimization: downsample factor (1=no downsample, 2=half size, 4=quarter size)
 DOWNSAMPLE_FACTOR = int(os.environ.get("DOWNSAMPLE_FACTOR", "4"))
-
-# Chunk size (rows) when processing NDVI in-memory
 NDVI_CHUNK_ROWS = int(os.environ.get("NDVI_CHUNK_ROWS", "1024"))
-
-# Sentinel-2 reflectance scaling factor (L2A typically uses 0-10000)
 S2_REFLECTANCE_SCALE = float(os.environ.get("S2_REFLECTANCE_SCALE", "10000.0"))
 
 # ---------------- Logging ----------------
@@ -67,17 +66,30 @@ b2_api = B2Api(info)
 b2_api.authorize_account("production", B2_APP_KEY_ID, B2_APP_KEY)
 bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
 
+# ---------------- Secure HTTP Session ----------------
 session = requests.Session()
-retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
-session.mount("https://", HTTPAdapter(max_retries=retries))
+session.trust_env = False
+retries = Retry(
+    total=5,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=frozenset(["GET", "POST", "HEAD"]),
+    raise_on_status=False,
+)
+adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=100)
+session.mount("https://", adapter)
+session.verify = certifi.where()
+session.headers.update({"User-Agent": "KisanShaktiNDVI/1.0 (+https://kisanshakti.ai/)"})
+
+# ---------------- Local Cache ----------------
+_signed_url_cache = TTLCache(maxsize=10000, ttl=6 * 60 * 60)  # 6-hour signed URL cache
 
 # ---------------- Helpers: Geometry ----------------
 def decode_geom_to_geojson(geom_value):
-    """Decode geometry into GeoJSON dict (accepts GeoJSON, WKT, WKB hex/bytestream)."""
     try:
         if geom_value is None:
             return None
-        if isinstance(geom_value, dict) and "type" in geom_value and "coordinates" in geom_value:
+        if isinstance(geom_value, dict) and "type" in geom_value:
             return geom_value
         if isinstance(geom_value, (bytes, bytearray)):
             return mapping(wkb.loads(geom_value))
@@ -86,45 +98,43 @@ def decode_geom_to_geojson(geom_value):
             if s.startswith("{") and s.endswith("}"):
                 try:
                     return json.loads(s)
-                except:
+                except Exception:
                     pass
             try:
                 return mapping(wkt.loads(s))
-            except:
-                pass
-            try:
-                # hex WKB
-                return mapping(wkb.loads(bytes.fromhex(s)))
-            except:
-                pass
+            except Exception:
+                try:
+                    return mapping(wkb.loads(bytes.fromhex(s)))
+                except Exception:
+                    return None
         return None
     except Exception as e:
         logging.error(f"decode_geom_to_geojson failed: {e}\n{traceback.format_exc()}")
         return None
 
+
 def extract_bbox(geom_json):
-    """Return GeoJSON bbox Polygon from geometry."""
     try:
         if not geom_json:
             return None
         geom = shape(geom_json)
-        bounds = geom.bounds  # (minx, miny, maxx, maxy)
+        bounds = geom.bounds
         return {
             "type": "Polygon",
             "coordinates": [[
-                [bounds[0], bounds[1]],  # SW
-                [bounds[2], bounds[1]],  # SE
-                [bounds[2], bounds[3]],  # NE
-                [bounds[0], bounds[3]],  # NW
-                [bounds[0], bounds[1]]   # Close
-            ]]
+                [bounds[0], bounds[1]],
+                [bounds[2], bounds[1]],
+                [bounds[2], bounds[3]],
+                [bounds[0], bounds[3]],
+                [bounds[0], bounds[1]],
+            ]],
         }
     except Exception as e:
         logging.error(f"Failed to extract bbox: {e}")
         return None
 
+
 def make_bbox_geom_wkt(bbox_json):
-    """Return 'SRID=4326;POLYGON(...)' WKT for PostGIS insertion (or None)."""
     try:
         if not bbox_json:
             return None
@@ -140,12 +150,8 @@ def make_bbox_geom_wkt(bbox_json):
 
 # ---------------- Helpers: MPC / B2 ----------------
 def fetch_agri_tiles():
-    """Fetch tiles flagged as agricultural from Supabase."""
     try:
-        resp = supabase.table("mgrs_tiles") \
-            .select("tile_id, geometry, country_id, id") \
-            .eq("is_agri", True) \
-            .execute()
+        resp = supabase.table("mgrs_tiles").select("tile_id, geometry, country_id, id").eq("is_agri", True).execute()
         tiles = resp.data or []
         logging.info(f"Fetched {len(tiles)} agri tiles")
         return tiles
@@ -153,30 +159,29 @@ def fetch_agri_tiles():
         logging.error(f"Failed to fetch agri tiles: {e}")
         return []
 
+
 def query_mpc(tile_geom, start_date, end_date):
-    """Query Microsoft Planetary Computer STAC search for scenes intersecting geometry."""
+    """Use pystac_client for robust Planetary Computer querying."""
     try:
         geom_json = decode_geom_to_geojson(tile_geom)
         if not geom_json:
             return []
-        body = {
-            "collections": [MPC_COLLECTION],
-            "intersects": geom_json,
-            "datetime": f"{start_date}/{end_date}",
-            "query": {"eo:cloud_cover": {"lt": CLOUD_COVER}},
-        }
-        logging.info(f"STAC query: {MPC_COLLECTION}, {start_date}->{end_date}, cloud<{CLOUD_COVER}")
-        resp = session.post(MPC_STAC, json=body, timeout=45)
-        if not resp.ok:
-            logging.error(f"STAC error {resp.status_code}: {resp.text}")
-            return []
-        return resp.json().get("features", [])
+        client = Client.open(f"{MPC_STAC}/search", headers={"User-Agent": "KisanShaktiNDVI/1.0"})
+        search = client.search(
+            collections=[MPC_COLLECTION],
+            intersects=geom_json,
+            datetime=f"{start_date}/{end_date}",
+            query={"eo:cloud_cover": {"lt": CLOUD_COVER}},
+        )
+        features = list(search.get_all_items())
+        logging.info(f"STAC query: {MPC_COLLECTION}, {start_date}->{end_date}, cloud<{CLOUD_COVER} -> {len(features)} results")
+        return [f.to_dict() for f in features]
     except Exception as e:
         logging.error(f"MPC query failed: {e}\n{traceback.format_exc()}")
         return []
 
+
 def _signed_asset_url(assets, primary_key, fallback_key=None):
-    """Return signed URL for MPC asset; fallback to other key if provided."""
     href = None
     if primary_key in assets and "href" in assets[primary_key]:
         href = assets[primary_key]["href"]
@@ -184,58 +189,48 @@ def _signed_asset_url(assets, primary_key, fallback_key=None):
         href = assets[fallback_key]["href"]
     if not href:
         return None
+
+    if href in _signed_url_cache:
+        return _signed_url_cache[href]
+
     try:
-        return pc.sign(href)
-    except:
+        signed = pc.sign(href)
+        _signed_url_cache[href] = signed
+        return signed
+    except Exception as e:
+        logging.warning(f"pc.sign failed for {href[:80]}: {e}")
         return href
 
+
 def check_b2_file_exists(b2_path):
-    """Check if file exists in B2 and return (exists_bool, size_bytes_or_None)."""
     try:
         file_info = bucket.get_file_info_by_name(b2_path)
-        return True, file_info.size if hasattr(file_info, "size") else None
+        return True, getattr(file_info, "size", None)
     except Exception:
         return False, None
 
+
 def get_b2_paths(tile_id, acq_date):
-    """Return canonical B2 relative paths for red, nir, ndvi."""
     return {
         "red": f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B04.tif",
         "nir": f"{B2_PREFIX}raw/{tile_id}/{acq_date}/B08.tif",
         "ndvi": f"{B2_PREFIX}ndvi/{tile_id}/{acq_date}/ndvi.tif",
     }
 
+
 def get_file_size(filepath):
-    """Return file size in bytes or None."""
     try:
         return os.path.getsize(filepath)
-    except:
+    except Exception:
         return None
 
-def download_from_b2(b2_path):
-    """Download a B2 object to a local temp file and return local path (or None)."""
-    try:
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
-        logging.info(f"📥 Downloading from B2: {b2_path}")
-        # b2sdk download helper expects file path or file-like — using NamedTemporaryFile object is fine if closed
-        bucket.download_file_by_name(b2_path, temp_file)
-        temp_file.close()
-        logging.info(f"✅ Downloaded from B2 to: {temp_file.name}")
-        return temp_file.name
-    except Exception as e:
-        logging.error(f"❌ Failed to download from B2: {e}")
-        return None
 
 def download_band(url, b2_path):
-    """
-    Download band from `url` (MPC signed asset), optionally downsample & compress,
-    upload compressed result to B2 at `b2_path`. Returns (local_compressed_path, b2_uri, size_bytes).
-    """
     raw_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     compressed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
     try:
-        logging.info(f"📥 Downloading from {url[:140]}...")
-        r = session.get(url, stream=True, timeout=120)
+        logging.info(f"📥 Downloading from {url[:120]} ...")
+        r = session.get(url, stream=True, timeout=(10, 120))
         if not r.ok:
             logging.error(f"❌ Download failed: {r.status_code}")
             return None, None, None
@@ -246,18 +241,11 @@ def download_band(url, b2_path):
                     f.write(chunk)
         logging.info(f"💾 Downloaded to temp: {raw_tmp.name}")
 
-        # Compress (and downsample if requested) with rasterio
         with rasterio.open(raw_tmp.name) as src:
             meta = src.meta.copy()
-
             if DOWNSAMPLE_FACTOR > 1:
                 out_shape = (src.height // DOWNSAMPLE_FACTOR, src.width // DOWNSAMPLE_FACTOR)
-                data = src.read(
-                    1,
-                    out_shape=out_shape,
-                    resampling=rasterio.enums.Resampling.average
-                )
-                # adjust transform to new size
+                data = src.read(1, out_shape=out_shape, resampling=rasterio.enums.Resampling.average)
                 meta.update({
                     "height": out_shape[0],
                     "width": out_shape[1],
@@ -269,17 +257,9 @@ def download_band(url, b2_path):
             else:
                 data = src.read(1)
 
-            meta.update(
-                compress="LZW",
-                tiled=True,
-                blockxsize=256,
-                blockysize=256
-            )
-
+            meta.update(compress="LZW", tiled=True, blockxsize=256, blockysize=256)
             with rasterio.open(compressed_tmp.name, "w", **meta) as dst:
                 dst.write(data, 1)
-
-            del data
 
         file_size = get_file_size(compressed_tmp.name)
         logging.info(f"☁️  Uploading to B2: {b2_path} ({file_size/1024/1024:.2f}MB)")
@@ -292,10 +272,8 @@ def download_band(url, b2_path):
         logging.error(f"❌ download_band failed: {e}\n{traceback.format_exc()}")
         return None, None, None
     finally:
-        try:
-            os.remove(raw_tmp.name)
-        except:
-            pass
+        try: os.remove(raw_tmp.name)
+        except Exception: pass
 
 # ---------------- NDVI Calculation (with reflectance scaling) ----------------
 def compute_and_upload_ndvi(tile_id, acq_date, red_local, nir_local):
@@ -709,4 +687,3 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
-
