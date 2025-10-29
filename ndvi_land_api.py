@@ -271,7 +271,7 @@ async def create_ndvi_request(
             try:
                 logger.info(f"⚡ Triggering instant NDVI processing for queue_id={queue_id}")
                 from ndvi_land_worker import process_request_async
-                worker_result = await process_request_async(queue_id, tenant_id, request.land_ids, tile_ids)
+                worker_result = await process_request_async(queue_id, tenant_id, request.land_ids)
                 instant_result = worker_result
                 final_status = "completed" if worker_result.get("processed_count", 0) > 0 else "failed"
 
