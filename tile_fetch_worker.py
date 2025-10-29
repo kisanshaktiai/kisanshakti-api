@@ -1,15 +1,15 @@
-──────────────────────────────────────────────────────────────────────────────
-File: tile_fetch_worker_v4.2.0.py
-Version: v4.2.0 Reflectance-Scaled Stable (Hybrid: full NDVI + bbox_geom)
-Author: Amarsinh Patil
-Date: 2025-10-29
-Purpose:
-Sentinel-2 NDVI tile processor for agricultural zones.
-Downloads RED/NIR bands from Microsoft Planetary Computer (MPC),
-compresses as COG, computes NDVI (with proper reflectance scaling),
-uploads to Backblaze B2, and updates Supabase satellite_tiles
-table with statistics plus geometry (bbox JSON + bbox_geom SRID=4326).
-──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# File: tile_fetch_worker_v4.2.0.py
+# Version: v4.2.0 Reflectance-Scaled Stable (Hybrid: full NDVI + bbox_geom)
+# Author: Amarsinh Patil
+# Date: 2025-10-29
+# Purpose:
+# Sentinel-2 NDVI tile processor for agricultural zones.
+# Downloads RED/NIR bands from Microsoft Planetary Computer (MPC),
+# compresses as COG, computes NDVI (with proper reflectance scaling),
+# uploads to Backblaze B2, and updates Supabase satellite_tiles
+# table with statistics plus geometry (bbox JSON + bbox_geom SRID=4326).
+# ──────────────────────────────────────────────────────────────────────────────
 #!/usr/bin/env python3
 import os
 import requests
@@ -709,3 +709,4 @@ if __name__ == "__main__":
     cc = int(os.environ.get("RUN_CLOUD_COVER", CLOUD_COVER))
     lb = int(os.environ.get("RUN_LOOKBACK_DAYS", LOOKBACK_DAYS))
     main(cc, lb)
+
