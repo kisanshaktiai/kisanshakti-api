@@ -1328,57 +1328,75 @@ if __name__ == "__main__":
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            queue_item = supabase.table("ndvi_request_queue").select("*").eq(
-                "id", args.queue_id
-            ).single().execute()
-            item = getattr(queue_item, "data", None) or (
-                queue_item.get("data") if isinstance(queue_item, dict) else None
-            )
-                       if not item:
-                logger.error(f"❌ Queue item {args.queue_id} not found in database.")
-            else:
-                tenant_id = item.get("tenant_id")
-                land_ids = item.get("land_ids", [])
-                tile_id_single = item.get("tile_id")
-                logger.info(f"🔍 Running single queue: {args.queue_id} | Tenant={tenant_id} | Lands={len(land_ids)}")
-                
-                # Mark as processing
-                try:
-                    supabase.table("ndvi_request_queue").update({
-                        "status": "processing",
-                        "started_at": now_iso(),
-                        "retry_count": (item.get("retry_count") or 0) + 1
-                    }).eq("id", args.queue_id).execute()
-                except Exception as e:
-                    logger.warning(f"Could not update queue status to processing: {e}")
-                
-                try:
-                    result = loop.run_until_complete(
-                        process_request_async(
-                            args.queue_id,
-                            tenant_id,
-                            land_ids,
-                            [tile_id_single] if tile_id_single else None
-                        )
+
+            try:
+                queue_item = supabase.table("ndvi_request_queue").select("*").eq(
+                    "id", args.queue_id
+                ).single().execute()
+
+                item = getattr(queue_item, "data", None) or (
+                    queue_item.get("data") if isinstance(queue_item, dict) else None
+                )
+
+                if not item:
+                    logger.error(f"❌ Queue item {args.queue_id} not found in database.")
+                else:
+                    tenant_id = item.get("tenant_id")
+                    land_ids = item.get("land_ids", [])
+                    tile_id_single = item.get("tile_id")
+                    logger.info(
+                        f"🔍 Running single queue: {args.queue_id} | "
+                        f"Tenant={tenant_id} | Lands={len(land_ids)}"
                     )
-                    logger.info("✅ Single queue processing completed")
-                    logger.info(json.dumps(result.get("quality_summary", {}), indent=2))
-                except Exception as e:
-                    logger.exception(f"Single queue processing failed: {e}")
+
+                    # Mark as processing
                     try:
                         supabase.table("ndvi_request_queue").update({
-                            "status": "failed",
-                            "last_error": str(e)[:500],
-                            "completed_at": now_iso()
+                            "status": "processing",
+                            "started_at": now_iso(),
+                            "retry_count": (item.get("retry_count") or 0) + 1
                         }).eq("id", args.queue_id).execute()
-                    except Exception:
-                        pass
-                finally:
-                    loop.close()
+                    except Exception as e:
+                        logger.warning(f"Could not update queue status to processing: {e}")
+
+                    # Main async execution
+                    try:
+                        result = loop.run_until_complete(
+                            process_request_async(
+                                args.queue_id,
+                                tenant_id,
+                                land_ids,
+                                [tile_id_single] if tile_id_single else None
+                            )
+                        )
+                        logger.info("✅ Single queue processing completed")
+                        logger.info(json.dumps(result.get("quality_summary", {}), indent=2))
+                    except Exception as e:
+                        logger.exception(f"Single queue processing failed: {e}")
+                        try:
+                            supabase.table("ndvi_request_queue").update({
+                                "status": "failed",
+                                "last_error": str(e)[:500],
+                                "completed_at": now_iso()
+                            }).eq("id", args.queue_id).execute()
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.exception(f"Single mode setup failed: {e}")
+
+        except Exception as e:
+            logger.critical(f"💥 Fatal error in single mode: {e}")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
     elif args.mode == "cron":
         try:
             run_cron(limit=args.limit)
         except Exception as e:
             logger.exception(f"Cron run failed: {e}")
+
     else:
         logger.error(f"Unknown mode: {args.mode}")
