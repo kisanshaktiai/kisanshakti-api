@@ -1205,7 +1205,7 @@ async def process_request_async(
     land_ids: List[str],
     tile_ids: Optional[List[str]] = None
 ) -> Dict[str, Any]:
-    """Process NDVI request with ML enhancements"""
+    """Process NDVI request with ML enhancements - FIXED exception handling"""
     logger.info(f"🚀 Queue {queue_id}: processing {len(land_ids)} lands (v11.0 ML-enhanced)")
     logger.info(f"   Features: adaptive_buffer={ADAPTIVE_BUFFERING}, super_res={SUPER_RESOLUTION_ENABLED}, "
                f"gaussian_weight={GAUSSIAN_WEIGHTING}, land_cover={LAND_COVER_FILTERING}")
@@ -1220,31 +1220,83 @@ async def process_request_async(
         lands = []
     
     if not lands:
-        return {"queue_id": queue_id, "processed_count": 0, "failed_count": len(land_ids), "results": [], "duration_ms": 0}
+        logger.error(f"❌ No lands found for tenant {tenant_id} with IDs {land_ids}")
+        return {
+            "queue_id": queue_id, 
+            "processed_count": 0, 
+            "failed_count": len(land_ids), 
+            "results": [{"land_id": lid, "success": False, "error": "Land not found in database"} for lid in land_ids], 
+            "duration_ms": 0
+        }
+    
+    logger.info(f"✅ Fetched {len(lands)} lands from database")
+    
+    # Log each land's geometry status for debugging
+    for land in lands:
+        land_id = land.get("id")
+        has_boundary = bool(land.get("boundary"))
+        has_boundary_geom = bool(land.get("boundary_geom"))
+        has_old = bool(land.get("boundary_polygon_old"))
+        logger.info(f"📍 Land {land_id}: boundary={has_boundary}, boundary_geom={has_boundary_geom}, old={has_old}")
     
     executor = ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS)
     sem = asyncio.Semaphore(MAX_CONCURRENT_LANDS)
     
     async def _proc(land):
         async with sem:
-            return await process_single_land_async_v11(land, tile_ids, None, executor)
+            try:
+                logger.info(f"🔄 Starting processing for land {land.get('id')}")
+                result = await process_single_land_async_v11(land, tile_ids, None, executor)
+                logger.info(f"{'✅' if result.get('success') else '❌'} Completed land {land.get('id')}: success={result.get('success')}")
+                return result
+            except Exception as e:
+                land_id = land.get("id", "unknown")
+                logger.exception(f"❌ Exception processing land {land_id}: {e}")
+                return {
+                    "land_id": land_id,
+                    "success": False,
+                    "error": f"Processing exception: {str(e)}",
+                    "traceback": traceback.format_exc()[:500]
+                }
     
+    # Create tasks
     tasks = [asyncio.create_task(_proc(land)) for land in lands]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
+    logger.info(f"📋 Created {len(tasks)} processing tasks")
     
-    processed = sum(1 for r in results if r.get("success"))
-    failed = [r for r in results if not r.get("success")]
+    # CRITICAL FIX: return_exceptions=True to capture individual failures
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Process results and handle exceptions
+    processed_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            # Task raised an exception
+            land_id = lands[i].get("id", "unknown")
+            logger.error(f"❌ Task exception for land {land_id}: {result}")
+            processed_results.append({
+                "land_id": land_id,
+                "success": False,
+                "error": f"Task exception: {str(result)}",
+                "traceback": traceback.format_exc()[:500]
+            })
+        else:
+            processed_results.append(result)
+    
+    # Count successes and failures
+    processed = sum(1 for r in processed_results if r.get("success"))
+    failed = [r for r in processed_results if not r.get("success")]
     duration_ms = int((time.time() - start_ts) * 1000)
     
     # Quality summary
     quality_summary = {
-        "high_confidence": sum(1 for r in results if r.get("stats", {}).get("confidence_level") == "high"),
-        "medium_confidence": sum(1 for r in results if r.get("stats", {}).get("confidence_level") == "medium"),
-        "low_confidence": sum(1 for r in results if r.get("stats", {}).get("confidence_level") == "low"),
-        "avg_quality_score": np.mean([r.get("stats", {}).get("quality_score", 0) for r in results if r.get("success")]) if processed > 0 else 0,
-        "avg_spatial_coherence": np.mean([r.get("stats", {}).get("spatial_coherence", 0) for r in results if r.get("success")]) if processed > 0 else 0
+        "high_confidence": sum(1 for r in processed_results if r.get("stats", {}).get("confidence_level") == "high"),
+        "medium_confidence": sum(1 for r in processed_results if r.get("stats", {}).get("confidence_level") == "medium"),
+        "low_confidence": sum(1 for r in processed_results if r.get("stats", {}).get("confidence_level") == "low"),
+        "avg_quality_score": np.mean([r.get("stats", {}).get("quality_score", 0) for r in processed_results if r.get("success")]) if processed > 0 else 0,
+        "avg_spatial_coherence": np.mean([r.get("stats", {}).get("spatial_coherence", 0) for r in processed_results if r.get("success")]) if processed > 0 else 0
     }
     
+    # Update queue status
     try:
         supabase.table("ndvi_request_queue").update({
             "status": "completed" if processed > 0 else "failed",
@@ -1252,21 +1304,28 @@ async def process_request_async(
             "failed_count": len(failed),
             "processing_duration_ms": duration_ms,
             "quality_summary": json.dumps(quality_summary),
+            "last_error": failed[0].get("error") if failed else None,
             "completed_at": now_iso()
         }).eq("id", queue_id).execute()
     except Exception as e:
         logger.error(f"Queue update failed: {e}")
     
     logger.info(f"✅ Queue {queue_id}: {processed} succeeded, {len(failed)} failed")
-    logger.info(f"   Quality: {quality_summary['high_confidence']}H / {quality_summary['medium_confidence']}M / {quality_summary['low_confidence']}L, "
-               f"avg_score={quality_summary['avg_quality_score']:.1f}, coherence={quality_summary['avg_spatial_coherence']:.2f}")
+    if failed:
+        logger.error(f"   Failed lands: {[f.get('land_id') for f in failed[:5]]}")
+        for fail in failed[:3]:  # Log first 3 failures in detail
+            logger.error(f"   - {fail.get('land_id')}: {fail.get('error', 'unknown error')}")
+    
+    if processed > 0:
+        logger.info(f"   Quality: {quality_summary['high_confidence']}H / {quality_summary['medium_confidence']}M / {quality_summary['low_confidence']}L, "
+                   f"avg_score={quality_summary['avg_quality_score']:.1f}, coherence={quality_summary['avg_spatial_coherence']:.2f}")
     
     return {
         "queue_id": queue_id,
         "processed_count": processed,
         "failed_count": len(failed),
         "quality_summary": quality_summary,
-        "results": results,
+        "results": processed_results,  # Include ALL results
         "duration_ms": duration_ms
     }
 
