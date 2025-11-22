@@ -1,27 +1,18 @@
 """
-NDVI Land API v5.1 - Production-Ready Multi-Tenant NDVI Processing API
-======================================================================
-Architecture:
-- Handles NDVI processing requests from tenant portals
-- Manages queue for batch processing
-- Provides real-time status monitoring
-- Integrates with B2 cloud storage and Supabase
-- Supports instant and queued processing modes
-
-Features:
-✅ Multi-tenant isolation
-✅ Geographic tile intersection detection
-✅ Batch processing with priority queuing
-✅ Real-time progress tracking
-✅ Comprehensive error handling & logging
-✅ RESTful API with OpenAPI docs
-✅ NDVI data retrieval endpoints
-✅ Global statistics endpoints
+NDVI Land API v5.2 - Fixed Silent Failure Issue
+================================================
+Changes:
+- Enhanced error handling for worker import
+- Better logging for debugging
+- Fixed misleading success messages
+- Added timeout handling
+- Improved exception reporting
 """
 
 import os
 import logging
 import datetime
+import traceback
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -51,6 +42,9 @@ B2_APP_KEY = os.getenv("B2_APP_KEY")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME", "kisanshakti-ndvi-tiles")
 RENDER_SERVICE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://ndvi-land-api.onrender.com")
 
+# Processing timeout (seconds)
+PROCESSING_TIMEOUT = int(os.getenv("PROCESSING_TIMEOUT", "300"))  # 5 minutes
+
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     logger.critical("❌ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     raise RuntimeError("Critical environment variables missing")
@@ -60,17 +54,16 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 logger.info(f"✅ Supabase client initialized: {SUPABASE_URL}")
 
 # =============================================================================
-# Pydantic Models
+# Pydantic Models (same as before)
 # =============================================================================
 class NDVIRequestCreate(BaseModel):
-    """Request model for creating NDVI processing job"""
     land_ids: List[str] = Field(..., min_items=1, description="List of land UUIDs to process")
-    tile_id: Optional[str] = Field(None, description="Optional specific tile ID (auto-detected if not provided)")
-    instant: bool = Field(False, description="Process immediately (true) or queue for batch (false)")
-    statistics_only: bool = Field(False, description="Only compute statistics, skip thumbnail generation")
+    tile_id: Optional[str] = Field(None, description="Optional specific tile ID")
+    instant: bool = Field(False, description="Process immediately (true) or queue (false)")
+    statistics_only: bool = Field(False, description="Only compute statistics")
     priority: int = Field(5, ge=1, le=10, description="Priority (1=highest, 10=lowest)")
-    farmer_id: Optional[str] = Field(None, description="Optional farmer ID for filtering")
-    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional metadata")
+    farmer_id: Optional[str] = Field(None, description="Optional farmer ID")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Metadata")
 
     @validator("land_ids")
     def validate_land_ids(cls, v):
@@ -80,7 +73,6 @@ class NDVIRequestCreate(BaseModel):
 
 
 class NDVIRequestResponse(BaseModel):
-    """Response model for NDVI request creation"""
     success: bool
     message: str
     queue_id: str
@@ -89,10 +81,10 @@ class NDVIRequestResponse(BaseModel):
     land_count: int
     estimated_completion: Optional[str] = None
     instant_result: Optional[Dict[str, Any]] = None
+    error_details: Optional[str] = None
 
 
 class QueueStatusResponse(BaseModel):
-    """Response model for queue status"""
     success: bool
     tenant_id: str
     total: int
@@ -104,7 +96,6 @@ class QueueStatusResponse(BaseModel):
 
 
 class HealthCheckResponse(BaseModel):
-    """Health check response"""
     status: str
     service: str
     version: str
@@ -113,27 +104,7 @@ class HealthCheckResponse(BaseModel):
     b2_configured: bool
 
 
-class NDVIDataItem(BaseModel):
-    """Single NDVI data record"""
-    id: str
-    tenant_id: str
-    land_id: str
-    date: str
-    mean_ndvi: Optional[float]
-    median_ndvi: Optional[float]
-    min_ndvi: Optional[float]
-    max_ndvi: Optional[float]
-    ndvi_std: Optional[float]
-    valid_pixels: Optional[int]
-    coverage_percentage: Optional[float]
-    confidence_level: Optional[str]
-    quality_score: Optional[float]
-    image_url: Optional[str]
-    created_at: str
-
-
 class NDVIDataResponse(BaseModel):
-    """Response model for NDVI data retrieval"""
     success: bool
     data: List[Dict[str, Any]]
     count: int
@@ -141,7 +112,6 @@ class NDVIDataResponse(BaseModel):
 
 
 class GlobalStatsResponse(BaseModel):
-    """Response model for global statistics"""
     success: bool
     stats: Dict[str, Any]
 
@@ -156,13 +126,30 @@ def now_iso() -> str:
 async def get_intersecting_tiles(tenant_id: str, land_ids: List[str]) -> List[str]:
     """Find intersecting MGRS tiles for given lands"""
     try:
+        # First verify lands exist and have geometry
         lands_response = supabase.table("lands").select(
-            "id, boundary_polygon_old, boundary, center_lat, center_lon"
+            "id, boundary_polygon_old, boundary, boundary_geom, center_lat, center_lon"
         ).eq("tenant_id", tenant_id).in_("id", land_ids).execute()
 
         if not lands_response.data:
+            logger.error(f"❌ No lands found for tenant {tenant_id} with IDs {land_ids}")
             raise ValueError(f"No lands found for tenant {tenant_id}")
 
+        # Log geometry availability for debugging
+        for land in lands_response.data:
+            land_id = land.get("id")
+            has_boundary = bool(land.get("boundary"))
+            has_boundary_geom = bool(land.get("boundary_geom"))
+            has_old = bool(land.get("boundary_polygon_old"))
+            has_coords = bool(land.get("center_lat") and land.get("center_lon"))
+            
+            logger.info(f"📍 Land {land_id}: boundary={has_boundary}, boundary_geom={has_boundary_geom}, "
+                       f"old={has_old}, coords={has_coords}")
+            
+            if not (has_boundary or has_boundary_geom or has_old or has_coords):
+                logger.error(f"❌ Land {land_id} has NO geometry data")
+
+        # Try RPC function first
         try:
             tiles_response = supabase.rpc(
                 "get_intersecting_tiles_for_lands",
@@ -170,13 +157,16 @@ async def get_intersecting_tiles(tenant_id: str, land_ids: List[str]) -> List[st
             ).execute()
             if tiles_response.data:
                 tile_ids = [t["tile_id"] for t in tiles_response.data]
+                logger.info(f"✅ Found {len(tile_ids)} tiles via RPC: {tile_ids}")
                 return list(set(tile_ids))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ RPC function failed: {e}")
 
+        # Fallback: use center coordinates if available
         tile_ids = set()
         for land in lands_response.data:
             if land.get("center_lat") and land.get("center_lon"):
+                # Get closest tile (simplified - in production use proper MGRS lookup)
                 tile_response = (
                     supabase.table("mgrs_tiles")
                     .select("tile_id")
@@ -187,11 +177,12 @@ async def get_intersecting_tiles(tenant_id: str, land_ids: List[str]) -> List[st
                     tile_ids.add(tile_response.data[0]["tile_id"])
 
         if not tile_ids:
+            logger.warning("⚠️ No tiles found, using default 43RGN")
             tile_ids.add("43RGN")
 
         return list(tile_ids)
     except Exception as e:
-        logger.error(f"Error finding intersecting tiles: {e}")
+        logger.error(f"❌ Error finding intersecting tiles: {e}\n{traceback.format_exc()}")
         return ["43RGN"]
 
 
@@ -216,7 +207,7 @@ async def create_queue_entry(
         "status": "queued",
         "requested_at": now_iso(),
         "created_at": now_iso(),
-        "metadata": {**metadata, "all_tiles": tile_ids, "api_version": "5.1"},
+        "metadata": {**metadata, "all_tiles": tile_ids, "api_version": "5.2"},
     }
 
     response = supabase.table("ndvi_request_queue").insert(queue_entry).execute()
@@ -224,7 +215,7 @@ async def create_queue_entry(
         raise HTTPException(status_code=500, detail="Failed to create queue entry")
 
     queue_id = response.data[0]["id"]
-    logger.info(f"✅ Queue entry created: {queue_id} | lands={len(land_ids)}")
+    logger.info(f"✅ Queue entry created: {queue_id} | lands={len(land_ids)} | tiles={tile_ids}")
     return queue_id
 
 
@@ -233,16 +224,15 @@ async def create_queue_entry(
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 NDVI Land API v5.1 starting...")
+    logger.info("🚀 NDVI Land API v5.2 starting...")
     logger.info("=" * 80)
-    logger.info("REGISTERED ENDPOINTS:")
     yield
     logger.info("🛑 NDVI Land API shutting down...")
 
 app = FastAPI(
     title="NDVI Land Processing API",
-    version="5.1.0",
-    description="Multi-tenant NDVI analysis API with data retrieval",
+    version="5.2.0",
+    description="Multi-tenant NDVI analysis API with enhanced error handling",
     lifespan=lifespan,
 )
 
@@ -260,10 +250,9 @@ app.add_middleware(
 # =============================================================================
 @app.get("/", include_in_schema=False)
 async def root():
-    """Root redirect to docs"""
     return {
         "service": "NDVI Land Processing API",
-        "version": "5.1.0",
+        "version": "5.2.0",
         "docs": "/docs",
         "health": "/api/v1/health"
     }
@@ -271,7 +260,6 @@ async def root():
 
 @app.get("/api/v1/health", response_model=HealthCheckResponse)
 async def health_check():
-    """Health check endpoint"""
     try:
         test_response = supabase.table("mgrs_tiles").select("tile_id").limit(1).execute()
         supabase_ok = bool(test_response.data)
@@ -282,7 +270,7 @@ async def health_check():
     return {
         "status": "healthy" if supabase_ok else "degraded",
         "service": "ndvi-land-api",
-        "version": "5.1.0",
+        "version": "5.2.0",
         "timestamp": now_iso(),
         "supabase_connected": supabase_ok,
         "b2_configured": bool(B2_APP_KEY_ID and B2_APP_KEY),
@@ -295,12 +283,9 @@ async def create_ndvi_request(
     tenant_id: str = Query(..., description="Tenant UUID"),
 ):
     """
-    Create a new NDVI processing request
-    
-    - **instant**: If true, process immediately; if false, queue for batch processing
-    - **land_ids**: List of land UUIDs to process
-    - **tile_id**: Optional - auto-detected if not provided
+    Create a new NDVI processing request with enhanced error handling
     """
+    queue_id = None
     try:
         logger.info(f"📥 NDVI request: tenant={tenant_id}, lands={len(request.land_ids)}, instant={request.instant}")
 
@@ -312,64 +297,156 @@ async def create_ndvi_request(
             .in_("id", request.land_ids)
             .execute()
         )
+        
         if not lands_check.data:
-            raise HTTPException(status_code=403, detail="Invalid land IDs for tenant")
+            logger.error(f"❌ No valid lands found for tenant {tenant_id}")
+            raise HTTPException(
+                status_code=403, 
+                detail=f"No valid land IDs found for tenant. Checked: {request.land_ids}"
+            )
+
+        found_land_ids = [land["id"] for land in lands_check.data]
+        missing_lands = set(request.land_ids) - set(found_land_ids)
+        if missing_lands:
+            logger.warning(f"⚠️ Missing lands: {missing_lands}")
 
         # Get intersecting tiles
-        tile_ids = [request.tile_id] if request.tile_id else await get_intersecting_tiles(tenant_id, request.land_ids)
+        tile_ids = [request.tile_id] if request.tile_id else await get_intersecting_tiles(tenant_id, found_land_ids)
         
+        if not tile_ids:
+            raise HTTPException(status_code=500, detail="Could not determine intersecting tiles")
+
         # Create queue entry
         queue_id = await create_queue_entry(
-            tenant_id, request.land_ids, tile_ids, request.priority, 
+            tenant_id, found_land_ids, tile_ids, request.priority, 
             request.statistics_only, request.farmer_id, request.metadata
         )
 
         instant_result = None
         final_status = "queued"
+        error_details = None
 
-        # ⚡ Instant processing mode
+        # ⚡ Instant processing mode with enhanced error handling
         if request.instant:
             try:
-                logger.info(f"⚡ Triggering instant NDVI processing for queue_id={queue_id}")
-                from ndvi_land_worker import process_request_async
-                worker_result = await process_request_async(queue_id, tenant_id, request.land_ids, tile_ids)
+                logger.info(f"⚡ Starting instant NDVI processing: queue_id={queue_id}")
+                
+                # Import worker with explicit error handling
+                try:
+                    from ndvi_land_worker import process_request_async
+                    logger.info("✅ Worker module imported successfully")
+                except ImportError as ie:
+                    error_msg = f"Worker module import failed: {str(ie)}"
+                    logger.error(f"❌ {error_msg}\n{traceback.format_exc()}")
+                    raise HTTPException(status_code=500, detail=error_msg)
+                
+                # Process with timeout
+                import asyncio
+                try:
+                    worker_result = await asyncio.wait_for(
+                        process_request_async(queue_id, tenant_id, found_land_ids, tile_ids),
+                        timeout=PROCESSING_TIMEOUT
+                    )
+                    logger.info(f"✅ Worker completed: {worker_result}")
+                except asyncio.TimeoutError:
+                    error_msg = f"Processing timeout after {PROCESSING_TIMEOUT}s"
+                    logger.error(f"❌ {error_msg}")
+                    raise HTTPException(status_code=504, detail=error_msg)
+                
                 instant_result = worker_result
-                final_status = "completed" if worker_result.get("processed_count", 0) > 0 else "failed"
-
+                processed_count = worker_result.get("processed_count", 0)
+                failed_count = worker_result.get("failed_count", 0)
+                
+                if processed_count > 0:
+                    final_status = "completed"
+                    logger.info(f"✅ Processing completed: {processed_count} succeeded, {failed_count} failed")
+                else:
+                    final_status = "failed"
+                    error_details = f"All {len(found_land_ids)} lands failed to process"
+                    logger.error(f"❌ {error_details}")
+                    
+                    # Get detailed failure reasons
+                    if worker_result.get("results"):
+                        failure_reasons = [
+                            f"Land {r.get('land_id')}: {r.get('error', 'unknown error')}"
+                            for r in worker_result["results"]
+                            if not r.get("success")
+                        ]
+                        error_details = "; ".join(failure_reasons[:3])  # First 3 errors
+                
+                # Update queue with results
                 supabase.table("ndvi_request_queue").update({
                     "status": final_status,
-                    "processed_count": worker_result.get("processed_count", 0),
-                    "failed_count": worker_result.get("failed_count", 0),
+                    "processed_count": processed_count,
+                    "failed_count": failed_count,
+                    "processing_duration_ms": worker_result.get("duration_ms", 0),
+                    "last_error": error_details,
                     "completed_at": now_iso(),
                 }).eq("id", queue_id).execute()
+                
+            except HTTPException:
+                raise
             except Exception as e:
-                logger.exception("Instant processing failed")
-                supabase.table("ndvi_request_queue").update({
-                    "status": "failed",
-                    "last_error": str(e),
-                }).eq("id", queue_id).execute()
+                error_msg = f"Instant processing failed: {str(e)}"
+                logger.exception(f"❌ {error_msg}")
+                
                 final_status = "failed"
-                instant_result = {"error": str(e)}
+                error_details = str(e)[:500]
+                instant_result = {"error": error_msg, "traceback": traceback.format_exc()[:1000]}
+                
+                # Update queue with error
+                try:
+                    supabase.table("ndvi_request_queue").update({
+                        "status": "failed",
+                        "last_error": error_details,
+                        "completed_at": now_iso(),
+                    }).eq("id", queue_id).execute()
+                except Exception as update_error:
+                    logger.error(f"Failed to update queue: {update_error}")
 
-        # Calculate ETA
-        eta_time = datetime.datetime.utcnow() + datetime.timedelta(seconds=len(request.land_ids) * 2)
+        # Calculate ETA for queued requests
+        eta_time = None if request.instant else datetime.datetime.utcnow() + datetime.timedelta(seconds=len(found_land_ids) * 2)
+        
+        # Determine success and message
+        success = final_status == "completed" if request.instant else True
+        if request.instant:
+            if final_status == "completed":
+                message = f"NDVI processing completed successfully ({instant_result.get('processed_count', 0)}/{len(found_land_ids)} lands)"
+            else:
+                message = f"NDVI processing failed: {error_details or 'Unknown error'}"
+        else:
+            message = "NDVI request queued successfully"
         
         return NDVIRequestResponse(
-            success=True,
-            message="NDVI request processed successfully" if request.instant else "NDVI request queued successfully",
+            success=success,
+            message=message,
             queue_id=queue_id,
             tenant_id=tenant_id,
             status=final_status,
-            land_count=len(request.land_ids),
-            estimated_completion=None if request.instant else eta_time.isoformat(),
+            land_count=len(found_land_ids),
+            estimated_completion=eta_time.isoformat() if eta_time else None,
             instant_result=instant_result,
+            error_details=error_details,
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Failed to create NDVI request")
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Failed to create NDVI request: {str(e)}"
+        logger.exception(f"❌ {error_msg}")
+        
+        # Try to mark queue as failed if it was created
+        if queue_id:
+            try:
+                supabase.table("ndvi_request_queue").update({
+                    "status": "failed",
+                    "last_error": str(e)[:500],
+                    "completed_at": now_iso(),
+                }).eq("id", queue_id).execute()
+            except Exception:
+                pass
+        
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @app.get("/api/v1/ndvi/data", response_model=NDVIDataResponse)
@@ -382,29 +459,20 @@ async def get_ndvi_data(
     limit: int = Query(100, ge=1, le=1000, description="Maximum records to return"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
 ):
-    """
-    Retrieve NDVI data for a tenant
-    
-    Returns processed NDVI records with statistics and quality metrics.
-    """
+    """Retrieve NDVI data for a tenant"""
     try:
         logger.info(f"📊 Fetching NDVI data: tenant={tenant_id}, land={land_id}, limit={limit}")
 
-        # Build query
         query = supabase.table("ndvi_data").select("*").eq("tenant_id", tenant_id)
         
         if land_id:
             query = query.eq("land_id", land_id)
-        
         if start_date:
             query = query.gte("date", start_date)
-        
         if end_date:
             query = query.lte("date", end_date)
         
-        # Execute query with pagination
         response = query.order("date", desc=True).range(offset, offset + limit - 1).execute()
-        
         data = response.data if response.data else []
         
         logger.info(f"✅ Retrieved {len(data)} NDVI records")
@@ -425,15 +493,10 @@ async def get_ndvi_data(
 async def get_global_stats(
     tenant_id: Optional[str] = Query(None, description="Filter by tenant ID"),
 ):
-    """
-    Get global NDVI statistics
-    
-    Returns aggregate statistics across all lands or filtered by tenant.
-    """
+    """Get global NDVI statistics"""
     try:
         logger.info(f"📈 Fetching global stats: tenant={tenant_id}")
 
-        # Build base query
         query = supabase.table("ndvi_data").select(
             "mean_ndvi, median_ndvi, quality_score, confidence_level, valid_pixels"
         )
@@ -441,14 +504,12 @@ async def get_global_stats(
         if tenant_id:
             query = query.eq("tenant_id", tenant_id)
         
-        # Get recent data (last 90 days)
         cutoff_date = (datetime.datetime.utcnow() - datetime.timedelta(days=90)).date().isoformat()
         response = query.gte("date", cutoff_date).execute()
         
         data = response.data if response.data else []
         
         if not data:
-            # Return empty stats if no data
             return GlobalStatsResponse(
                 success=True,
                 stats={
@@ -462,7 +523,6 @@ async def get_global_stats(
                 }
             )
         
-        # Calculate statistics
         mean_values = [r["mean_ndvi"] for r in data if r.get("mean_ndvi") is not None]
         quality_scores = [r["quality_score"] for r in data if r.get("quality_score") is not None]
         
@@ -490,10 +550,7 @@ async def get_global_stats(
         
         logger.info(f"✅ Global stats calculated: {stats['total_records']} records")
         
-        return GlobalStatsResponse(
-            success=True,
-            stats=stats,
-        )
+        return GlobalStatsResponse(success=True, stats=stats)
 
     except Exception as e:
         logger.exception("Failed to calculate global stats")
@@ -504,11 +561,7 @@ async def get_global_stats(
 async def get_queue_status(
     tenant_id: str = Query(..., description="Tenant UUID"),
 ):
-    """
-    Get processing queue status for a tenant
-    
-    Returns counts and details of queued, processing, completed, and failed jobs.
-    """
+    """Get processing queue status for a tenant"""
     try:
         logger.info(f"📋 Fetching queue status: tenant={tenant_id}")
 
@@ -518,7 +571,6 @@ async def get_queue_status(
         
         items = response.data if response.data else []
         
-        # Count by status
         status_counts = {
             "queued": sum(1 for i in items if i.get("status") == "queued"),
             "processing": sum(1 for i in items if i.get("status") == "processing"),
@@ -534,7 +586,7 @@ async def get_queue_status(
             processing=status_counts["processing"],
             completed=status_counts["completed"],
             failed=status_counts["failed"],
-            queue_items=items[:10],  # Return only latest 10
+            queue_items=items[:10],
         )
 
     except Exception as e:
@@ -547,7 +599,6 @@ async def get_queue_status(
 # =============================================================================
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Handle HTTP exceptions"""
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -560,7 +611,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """Handle general exceptions"""
     logger.exception("Unhandled exception")
     return JSONResponse(
         status_code=500,
@@ -573,25 +623,9 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 
 # =============================================================================
-# Startup Event - Log Routes
-# =============================================================================
-@app.on_event("startup")
-async def startup_event():
-    """Log all registered routes on startup"""
-    logger.info("=" * 80)
-    logger.info("📍 REGISTERED API ROUTES:")
-    logger.info("=" * 80)
-    for route in app.routes:
-        if hasattr(route, "methods"):
-            methods = ", ".join(route.methods)
-            logger.info(f"  {methods:12} {route.path}")
-    logger.info("=" * 80)
-
-
-# =============================================================================
 # Main Entry
 # =============================================================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-    logger.info(f"🚀 Starting NDVI Land API on port {port}")
+    logger.info(f"🚀 Starting NDVI Land API v5.2 on port {port}")
     uvicorn.run("ndvi_land_api:app", host="0.0.0.0", port=port, reload=False)
