@@ -430,44 +430,132 @@ def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 def extract_geometry_from_land(land_record: Dict) -> Optional[Dict]:
-    """Extract geometry GeoJSON from land record"""
+    """
+    Extract geometry GeoJSON from land record.
+    CORRECT PRIORITY for your schema:
+    1. boundary_geom (PostGIS geometry - populated by trigger)
+    2. boundary_polygon_old (jsonb - source data)
+    3. center_lat/center_lon (fallback point buffer)
+    """
     land_id = land_record.get("id", "<unknown>")
     
-    for key in ("boundary", "boundary_geom"):
-        val = land_record.get(key)
-        if not val:
-            continue
+    # Debug logging
+    logger.debug(f"Land {land_id} geometry fields available: "
+                f"boundary_geom={land_record.get('boundary_geom') is not None}, "
+                f"boundary_polygon_old={land_record.get('boundary_polygon_old') is not None}, "
+                f"center_coords={land_record.get('center_lat') is not None}")
+    
+    # ========================================================================
+    # PRIORITY 1: boundary_geom (PostGIS geometry - what your trigger populates)
+    # ========================================================================
+    boundary_geom_val = land_record.get("boundary_geom")
+    if boundary_geom_val:
         try:
-            if isinstance(val, str):
-                s = val.strip()
-                if s.startswith("{") or s.startswith("["):
-                    return json.loads(s)
-                if all(c in "0123456789abcdefABCDEF" for c in s.replace("0x", "")):
-                    geom_bytes = bytes.fromhex(s.replace("0x", ""))
-                else:
-                    return json.loads(s)
-            elif isinstance(val, (bytes, bytearray)):
-                geom_bytes = bytes(val)
-            elif isinstance(val, dict):
-                return val
-            else:
-                continue
-            shapely_geom = wkb.loads(geom_bytes)
-            return mapping(shapely_geom)
+            # Case 1: Already parsed as GeoJSON dict (Supabase sometimes does this)
+            if isinstance(boundary_geom_val, dict) and "type" in boundary_geom_val:
+                logger.info(f"✅ Land {land_id}: Using boundary_geom (GeoJSON dict)")
+                return boundary_geom_val
+            
+            # Case 2: WKB binary format (most common from PostGIS)
+            if isinstance(boundary_geom_val, (bytes, bytearray)):
+                shapely_geom = wkb.loads(boundary_geom_val)
+                geojson = mapping(shapely_geom)
+                logger.info(f"✅ Land {land_id}: Using boundary_geom (WKB binary)")
+                return geojson
+            
+            # Case 3: WKB hex string
+            if isinstance(boundary_geom_val, str):
+                s = boundary_geom_val.strip()
+                
+                # Try parsing as GeoJSON string first
+                if s.startswith("{"):
+                    try:
+                        parsed = json.loads(s)
+                        if "type" in parsed and "coordinates" in parsed:
+                            logger.info(f"✅ Land {land_id}: Using boundary_geom (GeoJSON string)")
+                            return parsed
+                    except:
+                        pass
+                
+                # Try parsing as WKB hex
+                try:
+                    hex_str = s.replace("0x", "").replace("0X", "")
+                    geom_bytes = bytes.fromhex(hex_str)
+                    shapely_geom = wkb.loads(geom_bytes)
+                    geojson = mapping(shapely_geom)
+                    logger.info(f"✅ Land {land_id}: Using boundary_geom (WKB hex)")
+                    return geojson
+                except Exception as wkb_error:
+                    logger.debug(f"WKB parsing failed: {wkb_error}")
+        
         except Exception as e:
-            logger.debug(f"Failed to parse {key}: {e}")
+            logger.warning(f"⚠️ Land {land_id}: Failed to parse boundary_geom: {e}")
+            # Continue to next priority
     
-    legacy = land_record.get("boundary_polygon_old")
-    if legacy:
+    # ========================================================================
+    # PRIORITY 2: boundary_polygon_old (jsonb - your source data)
+    # ========================================================================
+    boundary_old = land_record.get("boundary_polygon_old")
+    if boundary_old:
         try:
-            if isinstance(legacy, dict):
-                return legacy
-            if isinstance(legacy, str):
-                return json.loads(legacy)
-        except Exception:
-            pass
+            # Case 1: Already a dict
+            if isinstance(boundary_old, dict):
+                if "type" in boundary_old and "coordinates" in boundary_old:
+                    logger.info(f"✅ Land {land_id}: Using boundary_polygon_old (dict)")
+                    return boundary_old
+                else:
+                    logger.warning(f"⚠️ Land {land_id}: boundary_polygon_old dict missing type/coordinates")
+            
+            # Case 2: JSON string
+            if isinstance(boundary_old, str):
+                parsed = json.loads(boundary_old)
+                if "type" in parsed and "coordinates" in parsed:
+                    logger.info(f"✅ Land {land_id}: Using boundary_polygon_old (parsed string)")
+                    return parsed
+                else:
+                    logger.warning(f"⚠️ Land {land_id}: Parsed boundary_polygon_old missing type/coordinates")
+        
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ Land {land_id}: boundary_polygon_old JSON parse error: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Land {land_id}: Failed to use boundary_polygon_old: {e}")
     
-    logger.error(f"❌ No valid geometry for land {land_id}")
+    # ========================================================================
+    # PRIORITY 3: center_lat/center_lon (fallback - create point buffer)
+    # ========================================================================
+    center_lat = land_record.get("center_lat")
+    center_lon = land_record.get("center_lon")
+    if center_lat is not None and center_lon is not None:
+        try:
+            logger.warning(f"⚠️ Land {land_id}: No polygon found, creating 50m buffer from center point")
+            from shapely.geometry import Point
+            
+            # Create point and buffer ~50 meters (0.00045 degrees ≈ 50m at equator)
+            point = Point(float(center_lon), float(center_lat))
+            buffered = point.buffer(0.00045)  # degrees
+            
+            geojson = mapping(buffered)
+            logger.info(f"✅ Land {land_id}: Using center_lat/center_lon with 50m buffer")
+            return geojson
+        
+        except Exception as e:
+            logger.warning(f"⚠️ Land {land_id}: Failed to create buffer from center: {e}")
+    
+    # ========================================================================
+    # NO GEOMETRY FOUND - LOG EVERYTHING FOR DEBUGGING
+    # ========================================================================
+    logger.error(f"❌ Land {land_id}: NO VALID GEOMETRY found in any field!")
+    logger.error(f"   Available keys: {list(land_record.keys())}")
+    logger.error(f"   boundary_geom: {boundary_geom_val is not None} (type: {type(boundary_geom_val).__name__ if boundary_geom_val else 'None'})")
+    logger.error(f"   boundary_polygon_old: {boundary_old is not None} (type: {type(boundary_old).__name__ if boundary_old else 'None'})")
+    logger.error(f"   center_lat: {center_lat}, center_lon: {center_lon}")
+    
+    # Log first 200 chars of each field for debugging
+    if boundary_geom_val:
+        logger.error(f"   boundary_geom preview: {str(boundary_geom_val)[:200]}")
+    if boundary_old:
+        logger.error(f"   boundary_polygon_old preview: {str(boundary_old)[:200]}")
+    
     return None
 
 # ---------------- B2 Signed URL ----------------
