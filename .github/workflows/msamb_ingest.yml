@@ -53,7 +53,19 @@ jobs:
             pip install -r "$REQ"
           fi
       
-      - name: Run ingestion script (auto-locate)
+      - name: Verify Supabase credentials
+        run: |
+          if [ -z "${{ secrets.SUPABASE_URL }}" ]; then
+            echo "ERROR: SUPABASE_URL secret is not set!"
+            exit 1
+          fi
+          if [ -z "${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" ]; then
+            echo "ERROR: SUPABASE_SERVICE_ROLE_KEY secret is not set!"
+            exit 1
+          fi
+          echo "✓ Supabase credentials are configured"
+      
+      - name: Run ingestion script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -63,17 +75,13 @@ jobs:
         run: |
           cd kisanshakti-api
           echo "Current directory: $(pwd)"
-          echo "Contents:"
-          ls -la
           
-          SCRIPT=$(find .. -maxdepth 3 -type f -name "fetch_real_marketdata.py" | head -n1)
-          if [ -z "$SCRIPT" ]; then
-            echo "ERROR: fetch_real_marketdata.py not found!"
-            echo "Searching from repo root:"
-            cd ..
-            find . -type f -name "fetch_real_marketdata.py"
+          SCRIPT="../market-api/fetch_real_marketdata.py"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "ERROR: Script not found at $SCRIPT"
             exit 2
           fi
+          
           echo "Found script: $SCRIPT"
-          echo "Running: python $SCRIPT"
+          echo "Running ingestion..."
           python "$SCRIPT"
