@@ -18,12 +18,28 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Show repo layout (debug)
+        run: |
+          echo "=== repo root listing ==="
+          ls -la
+          echo "=== recursive listing (first 3 levels) ==="
+          ls -laR | sed -n '1,200p'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # Prefer market-api/requirements.txt if it exists, otherwise fall back to root requirements.txt
+          if [ -f "market-api/requirements.txt" ]; then
+            echo "Installing from market-api/requirements.txt"
+            pip install -r market-api/requirements.txt
+          elif [ -f "requirements.txt" ]; then
+            echo "Installing from requirements.txt (repo root)"
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found in market-api/ or repo root — skipping pip install"
+          fi
 
-      - name: Run ingress script
+      - name: Run ingress script (from market-api)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -31,5 +47,10 @@ jobs:
           REQUESTS_TIMEOUT: "30"
           THROTTLE_SECONDS: "1.2"
           UPSERT_BATCH_SIZE: "100"
+        working-directory: ./market-api
         run: |
-          python market-api\fetch_real_marketdata.py
+          echo "Current working directory: $(pwd)"
+          echo "Listing market-api directory:"
+          ls -la
+          # Ensure script is executable by calling with python and unix-style path
+          python ./fetch_real_marketdata.py
