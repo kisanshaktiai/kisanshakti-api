@@ -1,5 +1,4 @@
 name: msamb-ingest
-
 on:
   workflow_dispatch:
   schedule:
@@ -11,15 +10,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+      
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-
-     # snippet - replace the two steps "Install deps" and "Run ingestion script" with this block
-     
-  - name: Debug repo layout & locate script
+      
+      - name: Debug repo layout & locate script
         run: |
           echo "=== RUNNER PWD ==="
           pwd
@@ -27,43 +24,51 @@ jobs:
           echo "=== repo root listing ==="
           ls -la
           echo ""
+          echo "=== kisanshakti-api directory ==="
+          ls -la kisanshakti-api/ || echo "kisanshakti-api not found"
+          echo ""
+          echo "=== market-api directory ==="
+          ls -la kisanshakti-api/market-api/ || echo "market-api not found"
+          echo ""
           echo "=== find fetch_real_marketdata.py ==="
-          find . -maxdepth 4 -type f -name "fetch_real_marketdata.py" -print || true
+          find . -maxdepth 5 -type f -name "fetch_real_marketdata.py" -print || true
           echo ""
           echo "=== find requirements.txt ==="
-          find . -maxdepth 4 -type f -name "requirements.txt" -print || true
-    
-  - name: Install deps (auto-locate requirements)
-    env:
-      PIP_NO_INPUT: "1"
-    run: |
-      REQ=$(find . -maxdepth 4 -type f -name "requirements.txt" | head -n1)
-      if [ -z "$REQ" ]; then
-        echo "No requirements.txt found under repo, skipping pip install"
-      else
-        echo "Installing from $REQ"
-        python -m pip install --upgrade pip
-        pip install -r "$REQ"
-      fi
-  
-  - name: Run ingestion script (auto-locate)
-    env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      COMMODITY_HTML_DIR: ./market-api
-      REQUESTS_TIMEOUT: 30
-      THROTTLE_SECONDS: 1.2
-    run: |
-      SCRIPT=$(find . -maxdepth 4 -type f -name "fetch_real_marketdata.py" | head -n1)
-      if [ -z "$SCRIPT" ]; then
-        echo "ERROR: fetch_real_marketdata.py not found!"
-        echo "Repo layout:"
-        pwd
-        ls -la
-        exit 2
-      fi
-      echo "Found script: $SCRIPT"
-      echo "Running: python $SCRIPT"
-      python "$SCRIPT"
-
-
+          find . -maxdepth 5 -type f -name "requirements.txt" -print || true
+      
+      - name: Install deps (auto-locate requirements)
+        env:
+          PIP_NO_INPUT: "1"
+        run: |
+          REQ=$(find . -maxdepth 5 -type f -name "requirements.txt" -path "*/market-api/*" | head -n1)
+          if [ -z "$REQ" ]; then
+            echo "No requirements.txt found in market-api, checking kisanshakti-api..."
+            REQ=$(find . -maxdepth 5 -type f -name "requirements.txt" | head -n1)
+          fi
+          if [ -z "$REQ" ]; then
+            echo "No requirements.txt found under repo, skipping pip install"
+          else
+            echo "Installing from $REQ"
+            python -m pip install --upgrade pip
+            pip install -r "$REQ"
+          fi
+      
+      - name: Run ingestion script (auto-locate)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          COMMODITY_HTML_DIR: ./kisanshakti-api/market-api
+          REQUESTS_TIMEOUT: 30
+          THROTTLE_SECONDS: 1.2
+        run: |
+          SCRIPT=$(find . -maxdepth 5 -type f -name "fetch_real_marketdata.py" | head -n1)
+          if [ -z "$SCRIPT" ]; then
+            echo "ERROR: fetch_real_marketdata.py not found!"
+            echo "Repo layout:"
+            pwd
+            ls -la
+            exit 2
+          fi
+          echo "Found script: $SCRIPT"
+          echo "Running: python $SCRIPT"
+          python "$SCRIPT"
