@@ -32,4 +32,4 @@ jobs:
           THROTTLE_SECONDS: "1.2"
           UPSERT_BATCH_SIZE: "100"
         run: |
-          python fetch_real_marketdata.py
+          python market-api\fetch_real_marketdata.py
