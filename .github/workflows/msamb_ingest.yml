@@ -1,0 +1,35 @@
+name: MSAMB Ingest (scheduled)
+
+on:
+  schedule:
+    # Runs at 01:00 UTC every day — adjust as needed
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run ingress script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          COMMODITY_HTML_DIR: ${{ secrets.COMMODITY_HTML_DIR }} # optional
+          REQUESTS_TIMEOUT: "30"
+          THROTTLE_SECONDS: "1.2"
+          UPSERT_BATCH_SIZE: "100"
+        run: |
+          python msamb_dynamic_ingest.py
