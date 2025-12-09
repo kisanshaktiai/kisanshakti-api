@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-msamb_dynamic_ingest.py
+fetch_real_marketdata.py
 Dynamic APMC Scraper + Supabase Upsert
 Author: Amarsinh Patil (KisanShaktiAI) - updated
 Purpose:
