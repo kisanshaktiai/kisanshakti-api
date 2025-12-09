@@ -1,80 +1,35 @@
-name: MSAMB Ingest (scheduled)
+name: msamb-ingest
 
 on:
-  schedule:
-    # Runs at 01:00 UTC every day — adjust as needed
-    - cron: '0 1 * * *'
   workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes (adjust as needed)
 
 jobs:
-  ingest:
+  run-ingest:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Debug: show runner info and repo layout
-        run: |
-          echo "GH workspace: $GITHUB_WORKSPACE"
-          echo "Runner PWD: $(pwd)"
-          echo "Listing top-level:"
-          ls -la
-          echo "Recursive listing (first 500 lines):"
-          ls -laR | sed -n '1,500p'
-          echo "Find fetch_real_marketdata.py (show up to 20 matches):"
-          find . -maxdepth 6 -type f -name 'fetch_real_marketdata.py' -print | sed -n '1,20p'
-
-      - name: Install system deps (if needed)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -y
-          # Add system packages here if your requirements need them (uncomment if required)
-          # sudo apt-get install -y build-essential libpq-dev
-
-      - name: Install Python dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f "market-api/requirements.txt" ]; then
-            echo "Installing from market-api/requirements.txt"
-            pip install -r market-api/requirements.txt
-          elif [ -f "requirements.txt" ]; then
-            echo "Installing from repo root requirements.txt"
-            pip install -r requirements.txt
-          else
-            echo "No requirements.txt found, skipping pip install"
-          fi
+          pip install -r market-api/requirements.txt
 
-      - name: Run ingress script (using working-directory)
+      - name: Run ingestion
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          COMMODITY_HTML_DIR: ${{ secrets.COMMODITY_HTML_DIR }}
+          COMMODITY_HTML_DIR: market-api/data/commodities
           REQUESTS_TIMEOUT: "30"
-          THROTTLE_SECONDS: "1.2"
-          UPSERT_BATCH_SIZE: "100"
-        working-directory: ./market-api
+          THROTTLE_SECONDS: "1.5"
         run: |
-          echo "Working directory: $(pwd)"
-          echo "market-api listing:"
-          ls -la
-          # Run the script using a unix-style relative path
-          python ./fetch_real_marketdata.py
-
-      # Optional alternative step (uncomment and use instead of the above if you prefer no working-directory)
-      # - name: Run ingress script (explicit path, no working-directory)
-      #   env:
-      #     SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      #     SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      #     COMMODITY_HTML_DIR: ${{ secrets.COMMODITY_HTML_DIR }}
-      #     REQUESTS_TIMEOUT: "30"
-      #     THROTTLE_SECONDS: "1.2"
-      #     UPSERT_BATCH_SIZE: "100"
-      #   run: |
-      #     echo "Runner PWD: $(pwd)"
-      #     # Call script with explicit path from repo root
-      #     python market-api/fetch_real_marketdata.py
+          pwd
+          ls -la market-api
+          python market-api/msamb_dynamic_ingest.py
