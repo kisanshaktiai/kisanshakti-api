@@ -57,16 +57,21 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          COMMODITY_HTML_DIR: ./kisanshakti-api/market-api
+          COMMODITY_HTML_DIR: ../market-api
           REQUESTS_TIMEOUT: 30
           THROTTLE_SECONDS: 1.2
         run: |
-          SCRIPT=$(find . -maxdepth 5 -type f -name "fetch_real_marketdata.py" | head -n1)
+          cd kisanshakti-api
+          echo "Current directory: $(pwd)"
+          echo "Contents:"
+          ls -la
+          
+          SCRIPT=$(find .. -maxdepth 3 -type f -name "fetch_real_marketdata.py" | head -n1)
           if [ -z "$SCRIPT" ]; then
             echo "ERROR: fetch_real_marketdata.py not found!"
-            echo "Repo layout:"
-            pwd
-            ls -la
+            echo "Searching from repo root:"
+            cd ..
+            find . -type f -name "fetch_real_marketdata.py"
             exit 2
           fi
           echo "Found script: $SCRIPT"
