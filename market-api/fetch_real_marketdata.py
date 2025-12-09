@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# msamb_dynamic_ingest.py
+# fetch_real_marketdata.py
 """
 Dynamic APMC Scraper + Supabase Upsert
 Improved: stronger headers, debug logs, retries, JSON-safe checks, and run-summary.
