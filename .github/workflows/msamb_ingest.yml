@@ -32,4 +32,4 @@ jobs:
           THROTTLE_SECONDS: "1.2"
           UPSERT_BATCH_SIZE: "100"
         run: |
-          python msamb_dynamic_ingest.py
+          python fetch_real_marketdata.py
