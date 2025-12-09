@@ -22,14 +22,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r market-api/requirements.txt
 
-      - name: Run ingestion
+      - name: Run ingestion script
+        working-directory: ./kisanshakti-api
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          COMMODITY_HTML_DIR: market-api/data/commodities
-          REQUESTS_TIMEOUT: "30"
-          THROTTLE_SECONDS: "1.5"
+          COMMODITY_HTML_DIR: ./market-api
+          REQUESTS_TIMEOUT: 30
+          THROTTLE_SECONDS: 1.2
         run: |
-          pwd
-          ls -la market-api
-          python market-api/msamb_dynamic_ingest.py
+          echo "PWD: $(pwd)"
+          ls -la
+          echo "Running fetch_real_marketdata.py..."
+          python market-api/fetch_real_marketdata.py
+
