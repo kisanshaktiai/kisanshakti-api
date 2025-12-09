@@ -18,39 +18,63 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Show repo layout (debug)
+      - name: Debug: show runner info and repo layout
         run: |
-          echo "=== repo root listing ==="
+          echo "GH workspace: $GITHUB_WORKSPACE"
+          echo "Runner PWD: $(pwd)"
+          echo "Listing top-level:"
           ls -la
-          echo "=== recursive listing (first 3 levels) ==="
-          ls -laR | sed -n '1,200p'
+          echo "Recursive listing (first 500 lines):"
+          ls -laR | sed -n '1,500p'
+          echo "Find fetch_real_marketdata.py (show up to 20 matches):"
+          find . -maxdepth 6 -type f -name 'fetch_real_marketdata.py' -print | sed -n '1,20p'
 
-      - name: Install dependencies
+      - name: Install system deps (if needed)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          # Add system packages here if your requirements need them (uncomment if required)
+          # sudo apt-get install -y build-essential libpq-dev
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          # Prefer market-api/requirements.txt if it exists, otherwise fall back to root requirements.txt
           if [ -f "market-api/requirements.txt" ]; then
             echo "Installing from market-api/requirements.txt"
             pip install -r market-api/requirements.txt
           elif [ -f "requirements.txt" ]; then
-            echo "Installing from requirements.txt (repo root)"
+            echo "Installing from repo root requirements.txt"
             pip install -r requirements.txt
           else
-            echo "No requirements.txt found in market-api/ or repo root — skipping pip install"
+            echo "No requirements.txt found, skipping pip install"
           fi
 
-      - name: Run ingress script (from market-api)
+      - name: Run ingress script (using working-directory)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          COMMODITY_HTML_DIR: ${{ secrets.COMMODITY_HTML_DIR }} # optional
+          COMMODITY_HTML_DIR: ${{ secrets.COMMODITY_HTML_DIR }}
           REQUESTS_TIMEOUT: "30"
           THROTTLE_SECONDS: "1.2"
           UPSERT_BATCH_SIZE: "100"
         working-directory: ./market-api
         run: |
-          echo "Current working directory: $(pwd)"
-          echo "Listing market-api directory:"
+          echo "Working directory: $(pwd)"
+          echo "market-api listing:"
           ls -la
-          # Ensure script is executable by calling with python and unix-style path
+          # Run the script using a unix-style relative path
           python ./fetch_real_marketdata.py
+
+      # Optional alternative step (uncomment and use instead of the above if you prefer no working-directory)
+      # - name: Run ingress script (explicit path, no working-directory)
+      #   env:
+      #     SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      #     SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      #     COMMODITY_HTML_DIR: ${{ secrets.COMMODITY_HTML_DIR }}
+      #     REQUESTS_TIMEOUT: "30"
+      #     THROTTLE_SECONDS: "1.2"
+      #     UPSERT_BATCH_SIZE: "100"
+      #   run: |
+      #     echo "Runner PWD: $(pwd)"
+      #     # Call script with explicit path from repo root
+      #     python market-api/fetch_real_marketdata.py
