@@ -58,7 +58,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          COMMODITY_HTML_DIR: "."       # <- correct for files inside market-api/
+          COMMODITY_HTML_DIR: "./html"       # <- correct for files inside market-api/
           REQUESTS_TIMEOUT: "30"
           THROTTLE_SECONDS: "1.2"
           UPSERT_BATCH_SIZE: "100"
