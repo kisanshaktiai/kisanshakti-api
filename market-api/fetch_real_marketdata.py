@@ -192,11 +192,9 @@ def load_sources() -> List[Dict[str, Any]]:
         resp = sb.table("agri_market_sources").select("*").execute()
         rows = resp.data or []
 
-        # Filter active rows in Python.
-        # You can refine the condition depending on how you treat NULL:
-        # - only explicit True: r.get("active") is True
-        # - treat truthy: bool(r.get("active"))
-        active_rows = [r for r in rows if bool(r.get("active"))]
+        # Filter active rows in Python
+        # Only treat explicit True as active; NULL/False are inactive.
+        active_rows = [r for r in rows if r.get("active") is True]
 
         print(
             f"✅ Loaded {len(active_rows)} active sources "
