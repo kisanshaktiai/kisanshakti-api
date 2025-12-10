@@ -55,3 +55,21 @@ jobs:
           name: msamb-ingest-logs-${{ github.run_id }}
           path: market-api/ingest_run.log
           retention-days: 14
+
+      - name: Debug: show installed packages and key versions
+        run: |
+          echo "=== pip freeze (first 200 lines) ==="
+          python -m pip freeze | sed -n '1,200p' || true
+          echo "=== runtime module versions ==="
+          python - <<'PY'
+          import importlib
+          def ver(name):
+              try:
+                  m = importlib.import_module(name)
+                  v = getattr(m, "__version__", getattr(m, "VERSION", "unknown"))
+                  print(f"{name}: {v}")
+              except Exception as e:
+                  print(f"{name}: not installed or error: {e}")
+          for n in ("supabase","postgrest","requests","beautifulsoup4"):
+              ver(n)
+          PY
