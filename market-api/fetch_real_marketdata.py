@@ -178,37 +178,34 @@ def parse_msamb_table(html: str, commodity_display_name: str) -> List[Dict[str, 
 def load_sources() -> List[Dict[str, Any]]:
     """
     Load active sources from agri_market_sources.
-    Uses a PostgREST-safe string filter 'true' to avoid eq.True serialization issues.
-    Falls back to fetching all rows and filtering client-side if the REST call fails.
+
+    We deliberately avoid using any server-side boolean filter on `active`
+    (no .eq("active", True), no .filter("active", "eq", "true"), etc.)
+    because of the PGRST100 / Filters.EQ.True parsing issues.
+
+    Instead, we fetch all rows and filter on the client side.
     """
-    try:
-        # IMPORTANT: do NOT use .eq("active", True)
-        # This becomes eq.True and PostgREST rejects it.
-        # Using filter with a string "true" gives active=eq.true
-        resp = sb.table("agri_market_sources") \
-                 .select("*") \
-                 .filter("active", "eq", "true") \
-                 .execute()
+    print("DEBUG: using client-side filtered load_sources()")  # will appear in CI logs
 
-        sources = resp.data or []
-        print(f"✅ Loaded {len(sources)} active sources (via server filter)")
-        return sources
+    try:
+        # Fetch all rows from agri_market_sources
+        resp = sb.table("agri_market_sources").select("*").execute()
+        rows = resp.data or []
+
+        # Filter active rows in Python.
+        # You can refine the condition depending on how you treat NULL:
+        # - only explicit True: r.get("active") is True
+        # - treat truthy: bool(r.get("active"))
+        active_rows = [r for r in rows if bool(r.get("active"))]
+
+        print(
+            f"✅ Loaded {len(active_rows)} active sources "
+            f"(filtered client-side from {len(rows)} total rows)"
+        )
+        return active_rows
     except Exception as e:
-        # Useful debug output for CI logs
-        print("⚠️ Server-side filtered load failed:", repr(e))
-        print("⚠️ Falling back to unfiltered fetch and client-side filter...")
-
-    # Fallback: get everything and filter in Python (safer but more data transfer)
-    try:
-        resp2 = sb.table("agri_market_sources").select("*").execute()
-        rows = resp2.data or []
-        filtered = [r for r in rows if bool(r.get("active"))]
-        print(f"✅ Loaded {len(filtered)} active sources (via client-side filter from {len(rows)} rows)")
-        return filtered
-    except Exception as e2:
-        print("❌ Fallback fetch also failed:", repr(e2))
+        print("❌ Failed to load agri_market_sources:", repr(e))
         return []
-
 
 def load_commodity_alias_map(source_alias: str = "msamb") -> Dict[str, str]:
     resp = sb.table("commodity_master").select("global_code,aliases").execute()
