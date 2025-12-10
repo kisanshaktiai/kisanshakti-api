@@ -176,8 +176,32 @@ def parse_msamb_table(html: str, commodity_display_name: str) -> List[Dict[str, 
 
 # ---------- DB helpers ----------
 def load_sources() -> List[Dict[str, Any]]:
-    resp = sb.table("agri_market_sources").select("*").eq("active", True).execute()
-    return resp.data or []
+    """
+    Load active sources from agri_market_sources.
+    Uses a PostgREST-safe string filter 'true' to avoid eq.True serialization issues.
+    Falls back to fetching all rows and filtering client-side if the REST call fails.
+    """
+    try:
+        # Preferred: explicit filter call passing "true" as string so PostgREST receives eq.true
+        resp = sb.table("agri_market_sources").select("*").filter("active", "eq", "true").execute()
+        sources = resp.data or []
+        print(f"✅ Loaded {len(sources)} active sources (via server filter)")
+        return sources
+    except Exception as e:
+        # Useful debug output for CI logs
+        print("⚠️ Server-side filtered load failed:", repr(e))
+        print("⚠️ Falling back to unfiltered fetch and client-side filter...")
+
+    # Fallback: get everything and filter in Python (safer but more data transfer)
+    try:
+        resp2 = sb.table("agri_market_sources").select("*").execute()
+        rows = resp2.data or []
+        filtered = [r for r in rows if bool(r.get("active"))]
+        print(f"✅ Loaded {len(filtered)} active sources (via client-side filter from {len(rows)} rows)")
+        return filtered
+    except Exception as e2:
+        print("❌ Fallback fetch also failed:", repr(e2))
+        return []
 
 def load_commodity_alias_map(source_alias: str = "msamb") -> Dict[str, str]:
     resp = sb.table("commodity_master").select("global_code,aliases").execute()
