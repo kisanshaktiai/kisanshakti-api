@@ -2,9 +2,11 @@ beautifulsoup4==4.12.2
 requests==2.31.0
 lxml==4.9.3
 
-# Modern Supabase client (fixes the broken gotrue dependency)
-supabase==2.5.1
+# Use modern Supabase client (v2+). Removes old gotrue transitive pin.
+supabase>=2.0.0,<3.0.0
 
-# Required dependencies for the modern client
-supabase-auth==2.5.1
-postgrest==0.10.6
+# Optional/auth: install the modern auth package if you need explicit low-level auth libs.
+supabase-auth>=2.0.0
+
+# Postgrest client used by supabase runtime
+postgrest>=0.10.0
