@@ -179,21 +179,17 @@ def load_sources() -> List[Dict[str, Any]]:
     """
     Load active sources from agri_market_sources.
 
-    We deliberately avoid using any server-side boolean filter on `active`
-    (no .eq("active", True), no .filter("active", "eq", "true"), etc.)
-    because of the PGRST100 / Filters.EQ.True parsing issues.
-
-    Instead, we fetch all rows and filter on the client side.
+    We avoid using any server-side boolean filter on `active`
+    (no .eq("active", True), no .filter("active", "eq", "true")).
+    Instead, we fetch all rows and filter in Python.
     """
-    print("DEBUG: using client-side filtered load_sources()")  # will appear in CI logs
+    print("DEBUG: using client-side filtered load_sources()")
 
     try:
-        # Fetch all rows from agri_market_sources
         resp = sb.table("agri_market_sources").select("*").execute()
         rows = resp.data or []
 
-        # Filter active rows in Python
-        # Only treat explicit True as active; NULL/False are inactive.
+        # Only explicit True is treated as active
         active_rows = [r for r in rows if r.get("active") is True]
 
         print(
