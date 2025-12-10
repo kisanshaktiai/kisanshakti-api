@@ -1,7 +1,12 @@
 beautifulsoup4==4.12.2
 requests==2.31.0
 lxml==4.9.3
-supabase>=2.0.0
-supabase-auth>=2.0.0
-postgrest>=0.16.6
-gotrue==2.1
+
+# Supabase python client (v2+). pinned to a modern, available release to avoid old gotrue pins
+supabase==2.25.0
+
+# Auth library (modern replacement for old 'gotrue' usage). Include if you use auth-specific features.
+supabase-auth==2.25.0
+
+# Postgrest client (used by supabase runtime)
+postgrest==2.25.0
