@@ -4,3 +4,4 @@ lxml==4.9.3
 supabase>=2.0.0
 supabase-auth>=2.0.0
 postgrest>=0.16.6
+gotrue==2.1
