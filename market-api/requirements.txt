@@ -2,11 +2,9 @@ beautifulsoup4==4.12.2
 requests==2.31.0
 lxml==4.9.3
 
-# Use a modern Supabase client (v2+)
+# Modern Supabase client v2+ (compatible with current PyPI packages)
 supabase>=2.0.0,<3.0.0
+postgrest>=0.10.0,<1.0.0
 
-# Optional auth helper (only needed if your code requires low-level auth packages)
-supabase-auth>=2.0.0
-
-# Postgrest used by supabase client
-postgrest>=0.10.0
+# Optional: only if you need direct auth imports
+# supabase-auth>=2.0.0
