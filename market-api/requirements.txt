@@ -1,12 +1,16 @@
+cat > market-api/requirements.txt <<'REQ'
 beautifulsoup4==4.12.2
 requests==2.31.0
 lxml==4.9.3
 
-# Use modern Supabase client (v2+). Removes old gotrue transitive pin.
+# Use a modern Supabase client (v2+)
 supabase>=2.0.0,<3.0.0
-
-# Optional/auth: install the modern auth package if you need explicit low-level auth libs.
+# Optional auth helper (only needed if your code requires low-level auth packages)
 supabase-auth>=2.0.0
-
-# Postgrest client used by supabase runtime
+# Postgrest used by supabase client
 postgrest>=0.10.0
+REQ
+
+git add market-api/requirements.txt
+git commit -m "chore: update market-api/requirements to supabase v2+ to avoid missing gotrue pin"
+git push
