@@ -2,7 +2,7 @@ name: MSAMB Ingest (scheduled)
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # daily 01:00 UTC
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -31,7 +31,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Debug:show runner info and repo layout
+      - name: Debug: show runner info and repo layout
         run: |
           echo "GH workspace: $GITHUB_WORKSPACE"
           echo "Runner PWD: $(pwd)"
@@ -39,6 +39,11 @@ jobs:
           ls -la
           echo "Find script:"
           find . -maxdepth 6 -type f -name 'fetch_real_marketdata.py' -print | sed -n '1,50p'
+
+      - name: Debug: show market-api/requirements.txt
+        run: |
+          echo "=== market-api/requirements.txt on runner ==="
+          cat market-api/requirements.txt
 
       - name: Install Python dependencies
         run: |
@@ -53,12 +58,12 @@ jobs:
             echo "No requirements.txt found, skipping pip install"
           fi
 
-      - name: Run ingress script (using working-directory)
+      - name: Run ingress script
         working-directory: ./market-api
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          COMMODITY_HTML_DIR: "./html"       # <- correct for files inside market-api/
+          COMMODITY_HTML_DIR: "."
           REQUESTS_TIMEOUT: "30"
           THROTTLE_SECONDS: "1.2"
           UPSERT_BATCH_SIZE: "100"
@@ -67,7 +72,6 @@ jobs:
           ls -la
           python ./fetch_real_marketdata.py 2>&1 | tee ingest_run.log
 
-
       - name: Upload ingest logs artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -75,12 +79,3 @@ jobs:
           name: msamb-ingest-logs-${{ github.run_id }}
           path: market-api/ingest_run.log
           retention-days: 14
-
-      - name: Archive produced CSV (optional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: msamb-ingest-csv-${{ github.run_id }}
-          path: |
-            market-api/data/*.csv
-          retention-days: 7
