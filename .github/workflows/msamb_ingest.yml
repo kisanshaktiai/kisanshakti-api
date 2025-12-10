@@ -65,12 +65,7 @@ jobs:
         run: |
           echo "Working directory: $(pwd)"
           ls -la
-          # ensure script exists
-          if [ ! -f "./fetch_real_marketdata.py" ]; then
-            echo "ERROR: ./fetch_real_marketdata.py not found in working-directory!"
-            exit 2
-          fi
-          # run the script and capture stdout/stderr to log file
+          ...
           python ./fetch_real_marketdata.py 2>&1 | tee ingest_run.log
 
       - name: Upload ingest logs artifact

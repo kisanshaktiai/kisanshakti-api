@@ -182,8 +182,14 @@ def load_sources() -> List[Dict[str, Any]]:
     Falls back to fetching all rows and filtering client-side if the REST call fails.
     """
     try:
-        # Preferred: explicit filter call passing "true" as string so PostgREST receives eq.true
-        resp = sb.table("agri_market_sources").select("*").filter("active", "eq", "true").execute()
+        # IMPORTANT: do NOT use .eq("active", True)
+        # This becomes eq.True and PostgREST rejects it.
+        # Using filter with a string "true" gives active=eq.true
+        resp = sb.table("agri_market_sources") \
+                 .select("*") \
+                 .filter("active", "eq", "true") \
+                 .execute()
+
         sources = resp.data or []
         print(f"✅ Loaded {len(sources)} active sources (via server filter)")
         return sources
@@ -202,6 +208,7 @@ def load_sources() -> List[Dict[str, Any]]:
     except Exception as e2:
         print("❌ Fallback fetch also failed:", repr(e2))
         return []
+
 
 def load_commodity_alias_map(source_alias: str = "msamb") -> Dict[str, str]:
     resp = sb.table("commodity_master").select("global_code,aliases").execute()
