@@ -1,87 +1,85 @@
-name: msamb-ingest
+name: MSAMB Ingest (scheduled)
+
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'   # every 30 minutes (adjust as needed)
+    - cron: '0 1 * * *'   # daily 01:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: msamb-ingest
+  cancel-in-progress: false
 
 jobs:
-  run-ingest:
+  ingest:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      
-      - name: Debug repo layout & locate script
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Debug show runner info and repo layout
         run: |
-          echo "=== RUNNER PWD ==="
-          pwd
-          echo ""
-          echo "=== repo root listing ==="
+          echo "GH workspace: $GITHUB_WORKSPACE"
+          echo "Runner PWD: $(pwd)"
+          echo "Listing top-level:"
           ls -la
-          echo ""
-          echo "=== kisanshakti-api directory ==="
-          ls -la kisanshakti-api/ || echo "kisanshakti-api not found"
-          echo ""
-          echo "=== market-api directory ==="
-          ls -la kisanshakti-api/market-api/ || echo "market-api not found"
-          echo ""
-          echo "=== find fetch_real_marketdata.py ==="
-          find . -maxdepth 5 -type f -name "fetch_real_marketdata.py" -print || true
-          echo ""
-          echo "=== find requirements.txt ==="
-          find . -maxdepth 5 -type f -name "requirements.txt" -print || true
-      
-      - name: Install deps (auto-locate requirements)
-        env:
-          PIP_NO_INPUT: "1"
+          echo "Find script:"
+          find . -maxdepth 6 -type f -name 'fetch_real_marketdata.py' -print | sed -n '1,20p'
+
+      - name: Install Python dependencies
         run: |
-          REQ=$(find . -maxdepth 5 -type f -name "requirements.txt" -path "*/market-api/*" | head -n1)
-          if [ -z "$REQ" ]; then
-            echo "No requirements.txt found in market-api, checking kisanshakti-api..."
-            REQ=$(find . -maxdepth 5 -type f -name "requirements.txt" | head -n1)
-          fi
-          if [ -z "$REQ" ]; then
-            echo "No requirements.txt found under repo, skipping pip install"
+          python -m pip install --upgrade pip
+          if [ -f "market-api/requirements.txt" ]; then
+            echo "Installing from market-api/requirements.txt"
+            pip install -r market-api/requirements.txt
+          elif [ -f "requirements.txt" ]; then
+            echo "Installing from repo root requirements.txt"
+            pip install -r requirements.txt
           else
-            echo "Installing from $REQ"
-            python -m pip install --upgrade pip
-            pip install -r "$REQ"
+            echo "No requirements.txt found, skipping pip install"
           fi
-      
-      - name: Verify Supabase credentials
-        run: |
-          if [ -z "${{ secrets.SUPABASE_URL }}" ]; then
-            echo "ERROR: SUPABASE_URL secret is not set!"
-            exit 1
-          fi
-          if [ -z "${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" ]; then
-            echo "ERROR: SUPABASE_SERVICE_ROLE_KEY secret is not set!"
-            exit 1
-          fi
-          echo "✓ Supabase credentials are configured"
-      
-      - name: Run ingestion script
+
+      - name: Run ingress script (using working-directory)
+        working-directory: ./market-api
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          COMMODITY_HTML_DIR: ../market-api
-          REQUESTS_TIMEOUT: 30
-          THROTTLE_SECONDS: 1.2
+          COMMODITY_HTML_DIR: ./market-api   # path to local commodity HTML files (NOT a secret)
+          REQUESTS_TIMEOUT: "30"
+          THROTTLE_SECONDS: "1.2"
+          UPSERT_BATCH_SIZE: "100"
         run: |
-          cd kisanshakti-api
-          echo "Current directory: $(pwd)"
-          
-          SCRIPT="../market-api/fetch_real_marketdata.py"
-          if [ ! -f "$SCRIPT" ]; then
-            echo "ERROR: Script not found at $SCRIPT"
-            exit 2
-          fi
-          
-          echo "Found script: $SCRIPT"
-          echo "Running ingestion..."
-          python "$SCRIPT"
+          echo "Working directory: $(pwd)"
+          ls -la
+          python ./fetch_real_marketdata.py 2>&1 | tee ingest_run.log
+
+      - name: Upload ingest logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msamb-ingest-logs-${{ github.run_id }}
+          path: market-api/ingest_run.log
+          retention-days: 14
+
+      - name: Archive produced CSV (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msamb-ingest-csv-${{ github.run_id }}
+          path: |
+            market-api/data/*.csv
+          retention-days: 7
