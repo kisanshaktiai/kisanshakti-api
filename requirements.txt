@@ -71,6 +71,11 @@ mypy==1.13.0
 Pillow==10.4.0
 scipy>=1.11.0
 
+beautifulsoup4==4.12.3
+lxml==5.2.1
+
+
+
 
 
 
