@@ -1,4 +1,13 @@
 beautifulsoup4==4.12.2
 requests==2.31.0
+
+# Supabase client (Python)
 supabase==1.0.0
+postgrest==0.16.6
+gotrue==0.7.0
+storage3==0.6.0
+
 python-dotenv==1.0.0
+
+# Required parsing utilities
+python-dateutil==2.9.0
