@@ -31,7 +31,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Debug: show runner info and repo layout
+      - name: Debug:show runner info and repo layout
         run: |
           echo "GH workspace: $GITHUB_WORKSPACE"
           echo "Runner PWD: $(pwd)"
@@ -58,15 +58,15 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          COMMODITY_HTML_DIR: ./market-api   # path to local commodity HTML files (NOT a secret)
+          COMMODITY_HTML_DIR: "."       # <- correct for files inside market-api/
           REQUESTS_TIMEOUT: "30"
           THROTTLE_SECONDS: "1.2"
           UPSERT_BATCH_SIZE: "100"
         run: |
           echo "Working directory: $(pwd)"
           ls -la
-          ...
           python ./fetch_real_marketdata.py 2>&1 | tee ingest_run.log
+
 
       - name: Upload ingest logs artifact
         if: always()
