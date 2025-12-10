@@ -2,6 +2,5 @@ beautifulsoup4==4.12.2
 requests==2.31.0
 lxml==4.9.3
 
-# Supabase client (v2.x) - prevents pip from requesting old gotrue pins
-supabase==2.9.1
-postgrest==0.17.2
+# Supabase client (v2.x) - ensures postgrest compatible with supabase
+supabase>=2.25.0,<3.0.0
