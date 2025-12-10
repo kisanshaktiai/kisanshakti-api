@@ -27,89 +27,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          # hash the exact requirements file used by this job to avoid cache mismatch
           key: ${{ runner.os }}-pip-${{ hashFiles('market-api/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Debug: show runner info and repo layout
-        run: |
-          echo "GH workspace: $GITHUB_WORKSPACE"
-          echo "Runner PWD: $(pwd)"
-          echo "Listing top-level:"
-          ls -la
-          echo "Find script:"
-          find . -maxdepth 6 -type f -name 'fetch_real_marketdata.py' -print | sed -n '1,50p'
-
-      - name: Debug: show market-api/requirements.txt
-        run: |
-          echo "=== market-api/requirements.txt on runner (before patch) ==="
-          if [ -f market-api/requirements.txt ]; then
-            sed -n '1,200p' market-api/requirements.txt || true
-          else
-            echo "(file not found)"
-          fi
-
-      - name: Patch market-api/requirements.txt if it pins broken supabase==1.0.0
-        # This step edits the file on the runner if it contains the old broken pin.
-        run: |
-          if [ -f market-api/requirements.txt ]; then
-            if grep -qE "^supabase==1\\.0\\.0" market-api/requirements.txt; then
-              echo "Detected supabase==1.0.0 in market-api/requirements.txt — patching to modern v2+ pins"
-              cat > market-api/requirements.txt <<'REQ'
-beautifulsoup4==4.12.2
-requests==2.31.0
-lxml==4.9.3
-
-# Use a modern Supabase client (v2+)
-supabase>=2.0.0,<3.0.0
-# Optional auth helper (only needed if your code requires low-level auth packages)
-supabase-auth>=2.0.0
-# Postgrest used by supabase client
-postgrest>=0.10.0
-REQ
-            else
-              echo "No old supabase pin detected; leaving market-api/requirements.txt untouched."
-            fi
-          else
-            echo "market-api/requirements.txt not present; nothing to patch."
-          fi
-
-      - name: Debug: show market-api/requirements.txt (after patch)
-        run: |
-          echo "=== market-api/requirements.txt on runner (after patch) ==="
-          if [ -f market-api/requirements.txt ]; then
-            sed -n '1,200p' market-api/requirements.txt || true
-          else
-            echo "(file not found)"
-          fi
-
-      - name: Install Python dependencies (preinstall modern supabase as safeguard)
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          # Preinstall v2+ supabase so if some transitive pin is weird the modern client is present
-          python -m pip install "supabase>=2.0.0,<3.0.0" "supabase-auth>=2.0.0" "postgrest>=0.10.0" || true
-          if [ -f "market-api/requirements.txt" ]; then
-            echo "Installing from market-api/requirements.txt"
-            pip install -r market-api/requirements.txt
-          elif [ -f "requirements.txt" ]; then
-            echo "Installing from repo root requirements.txt"
-            pip install -r requirements.txt
-          else
-            echo "No requirements.txt found, skipping pip install"
-          fi
+          pip install -r market-api/requirements.txt
 
-      - name: Safety check: fail if any file still pins supabase==1.0.0 or gotrue==0.7.0
-        run: |
-          if git grep -nE "supabase==1\\.0\\.0|gotrue==0\\.7\\.0" -- 'market-api/*' || true; then
-            echo "ERROR: Found supabase==1.0.0 or gotrue==0.7.0 referenced in market-api files. Please update repository pins."
-            git grep -nE "supabase==1\\.0\\.0|gotrue==0\\.7\\.0" -- 'market-api/*' || true
-            exit 1
-          else
-            echo "No offending pins found in market-api/"
-          fi
-
-      - name: Run ingress script
+      - name: Run ingestion script
         working-directory: ./market-api
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -119,11 +46,9 @@ REQ
           THROTTLE_SECONDS: "1.2"
           UPSERT_BATCH_SIZE: "100"
         run: |
-          echo "Working directory: $(pwd)"
-          ls -la
           python ./fetch_real_marketdata.py 2>&1 | tee ingest_run.log
 
-      - name: Upload ingest logs artifact
+      - name: Upload ingest logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
