@@ -71,10 +71,17 @@ mypy==1.13.0
 Pillow==10.4.0
 scipy>=1.11.0
 
-beautifulsoup4==4.12.3
-lxml==5.2.1
+#=========
+beautifulsoup4==4.12.2
+requests==2.31.0
+lxml==4.9.3
 
+# Modern Supabase client v2+ (compatible with current PyPI packages)
+supabase>=2.0.0,<3.0.0
+postgrest>=0.10.0,<1.0.0
 
+# Optional: only if you need direct auth imports
+# supabase-auth>=2.0.0
 
 
 
