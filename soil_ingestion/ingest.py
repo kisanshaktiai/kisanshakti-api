@@ -151,6 +151,8 @@ def parse_power(data):
     parameters = data.get("properties",{}).get("parameter",{})
     if not isinstance(parameters,dict):
         raise ValueError("NASA POWER response missing parameters")
+    if data.get("header",{}).get("fill_value") not in (None,-999,-999.0):
+        raise ValueError("Unreviewed POWER fill-value convention")
     out = []
     for key,code in WETNESS.items():
         if key not in parameters or not isinstance(parameters[key],dict):
@@ -321,7 +323,7 @@ def load_land(session, url, key, land_id):
     uuid.UUID(land_id)
     base=url.rstrip("/")+"/rest/v1"
     headers={"apikey":key,"Authorization":"Bearer "+key}
-    r=session.get(base+"/lands",params={"select":"id,tenant_id,center_lat,center_lon",
+    r=session.get(base+"/lands",params={"select":"id,tenant_id,center_lat,center_lon,is_active,deleted_at",
                                           "id":"eq."+land_id},
                   headers=headers,timeout=40)
     r.raise_for_status()
@@ -331,6 +333,8 @@ def load_land(session, url, key, land_id):
     land=lands[0]
     if not land.get("tenant_id"):
         raise ValueError("Land has no tenant")
+    if land.get("deleted_at") is not None or land.get("is_active") is False:
+        raise PermissionError("Inactive or deleted land cannot receive observations")
     if land.get("center_lat") is None or land.get("center_lon") is None:
         raise ValueError("No verified land centroid; do not guess from area")
     lat,lon=valid_coords(float(land["center_lat"]),float(land["center_lon"]))
