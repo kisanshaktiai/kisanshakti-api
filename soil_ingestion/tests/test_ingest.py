@@ -161,3 +161,20 @@ def test_no_static_observation_timestamp():
 def test_no_available_npk_outputs():
     from soil_ingestion.ingest import ALLOWED
     assert not any("available" in key for values in ALLOWED.values() for key in values)
+
+def test_smap_task_cannot_be_reassigned_to_another_field(monkeypatch):
+    from soil_ingestion.ingest import appeears_fetch
+    monkeypatch.setenv("APPEEARS_TOKEN","fake-local-token")
+    task={"params":{"coordinates":[{"latitude":18.525,"longitude":73.855}]},"status":"done"}
+    session=Session([Response(task)])
+    with pytest.raises(PermissionError,match="differ"):
+        appeears_fetch(session,"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",19.0,73.855)
+    assert len(session.calls)==1
+
+def test_smap_task_requires_provenance_coordinates(monkeypatch):
+    from soil_ingestion.ingest import appeears_fetch
+    monkeypatch.setenv("APPEEARS_TOKEN","fake-local-token")
+    session=Session([Response({"status":"done","params":{}})])
+    with pytest.raises(ValueError,match="verifiable target coordinate"):
+        appeears_fetch(session,"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",18.525,73.855)
+    assert len(session.calls)==1
