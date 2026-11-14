@@ -31,6 +31,18 @@ def main():
         ("SUBSET","Y(2061181,2062181)"),
         ("SUBSETTINGCRS","http://www.opengis.net/def/crs/EPSG/0/152160"),
         ("OUTPUTCRS","http://www.opengis.net/def/crs/EPSG/0/152160")]),
+      "soilgrids_mean_pune":"https://maps.isric.org/mapserv?"+urlencode([
+        ("map","/map/phh2o.map"),("SERVICE","WCS"),("VERSION","2.0.1"),("REQUEST","GetCoverage"),
+        ("COVERAGEID","phh2o_0-5cm_mean"),("FORMAT","GEOTIFF_INT16"),
+        ("SUBSET","X(7968349,7969349)"),("SUBSET","Y(2061181,2062181)"),
+        ("SUBSETTINGCRS","http://www.opengis.net/def/crs/EPSG/0/152160"),
+        ("OUTPUTCRS","http://www.opengis.net/def/crs/EPSG/0/152160")]),
+      "soilgrids_senegal":"https://maps.isric.org/mapserv?"+urlencode([
+        ("map","/map/phh2o.map"),("SERVICE","WCS"),("VERSION","2.0.1"),("REQUEST","GetCoverage"),
+        ("COVERAGEID","phh2o_0-5cm_Q0.5"),("FORMAT","GEOTIFF_INT16"),
+        ("SUBSET","X(-1550500,-1549500)"),("SUBSET","Y(1619500,1620500)"),
+        ("SUBSETTINGCRS","http://www.opengis.net/def/crs/EPSG/0/152160"),
+        ("OUTPUTCRS","http://www.opengis.net/def/crs/EPSG/0/152160")]),
       "appeears_product":"https://appeears.earthdatacloud.nasa.gov/api/product/SPL4SMGP.008"
     }
     results={}
@@ -38,7 +50,7 @@ def main():
         try:
             status,ctype,blob=request(url)
             d={"http_status":status,"bytes":len(blob),"content_type":ctype}
-            if name=="soilgrids_getcoverage":
+            if name.startswith("soilgrids_") and name not in ("soilgrids_capabilities",):
                 d["looks_like_tiff"]=blob[:4] in (b"II*\x00",b"MM\x00*")
                 if d["looks_like_tiff"]:
                     from io import BytesIO
