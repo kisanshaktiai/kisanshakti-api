@@ -144,7 +144,7 @@ def get_soilgrids(session, lat, lon, depth="0-5cm", statistics=("Q0.05", "Q0.5",
                 depth_bottom_cm=bottom,statistic=stat,reference=res.url,
                 metadata={"coverage_id":cov,"raw_value":raw,"native_divisor":divisor,
                           "modelled_not_measured":True,"nominal_grid_m":250,
-                          "soilgrids_depth":depth,"license":"CC-BY-4.0"}))
+                          "soilgrids_depth":depth,"license":"CC-BY-4.0","ingestion_transport":"WCS"}))
     return out
 
 def parse_soilgrids_rest(data, *, depth="0-5cm", statistics=("Q0.05","Q0.5","Q0.95"),
@@ -428,7 +428,8 @@ def upsert(session, url, key, land, lat, lon, records, write):
                 rec.get("observed_at"),rec["statistic"],
                 rec["source_metadata"].get("coverage_id") or
                 rec["source_metadata"].get("power_parameter") or
-                rec["source_metadata"].get("layer")]
+                rec["source_metadata"].get("layer"),
+                rec["source_metadata"].get("ingestion_transport")]
         digest=hashlib.sha256(json.dumps(stable,separators=(",",":"),sort_keys=True).encode()).hexdigest()
         rows.append(dict(record_key=digest,land_id=land["id"],tenant_id=land["tenant_id"],
           requested_lat=lat,requested_lon=lon,**rec))
