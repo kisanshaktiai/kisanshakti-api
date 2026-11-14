@@ -6,7 +6,7 @@
 
 | Provider | Operational interface | Stored properties | Confidence limitations |
 |---|---|---|---|
-| ISRIC SoilGrids | WCS GeoTIFF | predicted pH, SOC, total N, sand/silt/clay, bulk density, CEC | static 250 m predicted values, depth and Q0.05/Q0.5/Q0.95 recorded; excludes available NPK |
+| ISRIC SoilGrids | WCS GeoTIFF (primary), REST JSON point query (optional beta) | predicted pH, SOC, total N, sand/silt/clay, bulk density, CEC | static 250 m predicted values, depth and Q0.05/Q0.5/Q0.95 recorded; excludes available NPK |
 | NASA POWER | daily point API, `community=AG` | `GWETTOP`, `GWETROOT`, `GWETPROF` | **relative wetness fractions** only, NOT volumetric moisture or SMAP measurements |
 | NASA SMAP Level 4 V8 | AppEEARS authenticated point task | surface/root-zone volumetric moisture | 9 km model assimilation, not measured field moisture; asynchronous tasks |
 
@@ -40,6 +40,10 @@ python -m soil_ingestion.ingest --land-id LAND_UUID --provider power \
 
 python -m soil_ingestion.ingest --land-id LAND_UUID --provider soilgrids \
   --depth 0-5cm --out result_soilgrids.json
+
+# Optional ISRIC beta REST; one request for all properties and quantiles:
+python -m soil_ingestion.ingest --land-id LAND_UUID --provider soilgrids \
+  --soilgrids-transport rest --depth 0-5cm --out result_soilgrids_rest.json
 
 # Start an authenticated NASA SMAP extraction (no soil writes):
 export APPEEARS_TOKEN=SHORT_LIVED_TOKEN
@@ -75,3 +79,12 @@ One authorized source-data canary was executed at the coordinates of an existing
 The canary used an internal SQL integration path, not the CLI's credentialed write path. The CLI's write path remains **unit-tested but not live-tested end to end**. This is not proof of correctness for all lands, providers, or crop decisions. The dataset's spatial grid is much coarser than typical smallholder farm boundaries.
 
 Do not display NASA `GWET*` numbers as volumetric moisture percentages, nor label them as measured by farm sensors.
+
+## SoilGrids official REST and WRB endpoint validation
+
+- Public API specification: `https://rest.isric.org/soilgrids/v2.0/openapi.json`
+- Soil-property endpoint: `https://rest.isric.org/soilgrids/v2.0/properties/query` — latitude/longitude, repeated `property`, `depth`, and `value` parameters; returns GeoJSON with layer/depth/quantile values. New optional CLI `--soilgrids-transport rest`.
+- WRB class endpoint: `https://rest.isric.org/soilgrids/v2.0/classification/query` — most probable class plus class probabilities; **not** a pH/OC/NPK endpoint. WRB classes are not currently inserted into the numerical soil observations schema.
+- WCS remains primary. REST is ISRIC beta, documented temporary outages and 5 requests/minute fair-use limit. Query multiple properties/quantiles in one REST call. No automatic fallback that converts missing properties to defaults.
+- A zero pH response for the urban Pune validation point corresponded to a null REST pH; rural Maharashtra test sites returned valid predictions. Treat absent/invalid pixels as missing, not measured zeros.
+- Values are *predicted* and not laboratory observations. Still cannot infer available phosphorus or potassium from SoilGrids.
