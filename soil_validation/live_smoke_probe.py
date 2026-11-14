@@ -39,8 +39,21 @@ def main():
             status,ctype,blob=request(url)
             d={"http_status":status,"bytes":len(blob),"content_type":ctype}
             if name=="soilgrids_getcoverage":
-                d["first_bytes"]=repr(blob[:24]);d["looks_like_tiff"]=blob[:4] in (b"II*\\x00",b"MM\\x00*")
-                if not d["looks_like_tiff"]:d["provider_error"]=blob[:500].decode(errors="replace")
+                d["looks_like_tiff"]=blob[:4] in (b"II*\x00",b"MM\x00*")
+                if d["looks_like_tiff"]:
+                    from io import BytesIO
+                    from rasterio.io import MemoryFile
+                    from pyproj import Transformer
+                    with MemoryFile(blob) as mem:
+                        with mem.open() as ds:
+                            x,y=Transformer.from_crs("EPSG:4326",ds.crs,always_xy=True).transform(73.8567,18.5204)
+                            sample=list(ds.sample([(x,y)],masked=True))[0][0]
+                            d["pixel_masked"]=bool(getattr(sample,"mask",False))
+                            if not d["pixel_masked"]:
+                                d["raw_ph"]=float(sample)
+                                d["estimated_ph"]=float(sample)/10.0
+                            d["crs"]=str(ds.crs)
+                else:d["provider_error"]=blob[:350].decode(errors="replace")
             elif name=="soilgrids_capabilities" and status==200:
                 root=ET.fromstring(blob)
                 identifiers=[e.text for e in root.iter() if e.tag.rsplit("}",1)[-1]=="CoverageId"]
