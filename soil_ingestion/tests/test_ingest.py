@@ -178,3 +178,24 @@ def test_smap_task_requires_provenance_coordinates(monkeypatch):
     with pytest.raises(ValueError,match="verifiable target coordinate"):
         appeears_fetch(session,"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",18.525,73.855)
     assert len(session.calls)==1
+
+def test_nasa_power_preserves_underlying_model_source_metadata():
+    data={"header":{"sources":["MERRA2","GEOSIT"],"time_standard":"UTC",
+                    "api":{"version":"v2.10.3"}},
+          "properties":{"parameter":{
+              "GWETTOP":{"20261001":0.66},
+              "GWETROOT":{"20261001":0.65},
+              "GWETPROF":{"20261001":0.67}}}}
+    rows=parse_power(data)
+    assert len(rows)==3
+    assert all(r["source_metadata"]["source_products"]==["MERRA2","GEOSIT"] for r in rows)
+    assert all(r["source_metadata"]["time_standard"]=="UTC" for r in rows)
+    assert all(r["source_metadata"]["api_version"]=="v2.10.3" for r in rows)
+
+def test_nasa_power_unexpected_fill_value_refused():
+    data={"header":{"fill_value":-888},"properties":{"parameter":{
+      "GWETTOP":{"20261001":-888},
+      "GWETROOT":{"20261001":-888},
+      "GWETPROF":{"20261001":-888}}}}
+    with pytest.raises(ValueError,match="fill-value"):
+        parse_power(data)
