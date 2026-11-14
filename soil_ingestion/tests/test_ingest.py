@@ -242,3 +242,21 @@ def test_rest_only_one_request_with_repeated_property_keys():
     assert len(session.calls)==1
     assert session.calls[0][2]["params"]==[
        ("lon",73.8),("lat",18.5),("property","phh2o"),("depth","0-5cm"),("value","Q0.5")]
+
+def test_wcs_and_rest_keep_separate_record_keys(monkeypatch):
+    monkeypatch.setenv("SOIL_INGEST_WRITE_ENABLED","yes")
+    from soil_ingestion.ingest import upsert
+    land={"id":"00000000-0000-0000-0000-000000000001",
+          "tenant_id":"00000000-0000-0000-0000-000000000002"}
+    base={"provider":"ISRIC_SOILGRIDS","property_code":"soil_ph","unit":"pH",
+          "value":6.5,"depth_top_cm":0,"depth_bottom_cm":5,"observed_at":None,
+          "statistic":"Q0.5","source_reference":"https://maps.isric.org",
+          "source_metadata":{"coverage_id":"phh2o_0-5cm_Q0.5","ingestion_transport":"WCS"}}
+    alternative={**base,"value":6.6,
+       "source_metadata":{"coverage_id":"phh2o_0-5cm_Q0.5","ingestion_transport":"REST"}}
+    session=Session([Response()])
+    upsert(session,"https://example.supabase.co","key",land,16.75,74.2,
+           [base,alternative],True)
+    rows=session.calls[0][2]["json"]
+    assert len(rows)==2
+    assert rows[0]["record_key"]!=rows[1]["record_key"]
