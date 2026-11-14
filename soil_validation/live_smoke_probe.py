@@ -18,7 +18,9 @@ def main():
     endpoints={
       "soilgrids_capabilities":"https://maps.isric.org/mapserv?"+urlencode({"map":"/map/phh2o.map","SERVICE":"WCS","VERSION":"2.0.0","REQUEST":"GetCapabilities"}),
       "power_HY_SFMC_RZMC":base_power+"?"+urlencode({**base,"parameters":"SFMC,RZMC","community":"HY"}),
-      "power_AG_SFMC_RZMC":base_power+"?"+urlencode({**base,"parameters":"SFMC,RZMC","community":"AG"}),
+      "power_AG_SFMC_RZMC_2026":base_power+"?"+urlencode({**base,"parameters":"SFMC,RZMC","community":"AG"}),
+      "power_AG_SFMC_RZMC_2024":base_power+"?"+urlencode({**base,"start":"20240101","end":"20240107","parameters":"SFMC,RZMC","community":"AG"}),
+      "power_AG_SFMC_RZMC_2025":base_power+"?"+urlencode({**base,"start":"20250101","end":"20250107","parameters":"SFMC,RZMC","community":"AG"}),
       "power_HY_SFMC":base_power+"?"+urlencode({**base,"parameters":"SFMC","community":"HY"}),
       "power_HY_T2M":base_power+"?"+urlencode({**base,"parameters":"T2M","community":"HY"}),
       "appeears_product":"https://appeears.earthdatacloud.nasa.gov/api/product/SPL4SMGP.008"
@@ -43,6 +45,8 @@ def main():
                         params=data.get("properties",{}).get("parameter",{})
                         d["parameter_names"]=list(params)
                         d["valid_counts"]={k:sum(isinstance(v,(float,int)) and 0<=v<=1 for v in values.values()) for k,values in params.items()}
+                        d["parameter_samples"]={k:list(values.items())[:2] for k,values in params.items()}
+                        d["header"]={k:v for k,v in data.get("header",{}).items() if k in ("title","source","fill_value")}
                     else:
                         d["provider_error"]=str(data)[:1600]
                 except Exception:
