@@ -168,7 +168,10 @@ def parse_power(data):
                 observed_at=current.isoformat()+"T00:00:00+00:00",statistic="daily",
                 reference=POWER_URL,metadata={"power_parameter":key,
                   "modelled_wetness_not_volumetric_water":True,
-                  "product_attribution":"POWER_grid_not_field_sensor"}))
+                  "product_attribution":"POWER_grid_not_field_sensor",
+                  "source_products":data.get("header",{}).get("sources",[]),
+                  "time_standard":data.get("header",{}).get("time_standard"),
+                  "api_version":data.get("header",{}).get("api",{}).get("version")}))
     return out
 
 def get_power(session,lat,lon,start,end):
