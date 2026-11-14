@@ -147,6 +147,73 @@ def get_soilgrids(session, lat, lon, depth="0-5cm", statistics=("Q0.05", "Q0.5",
                           "soilgrids_depth":depth,"license":"CC-BY-4.0"}))
     return out
 
+def parse_soilgrids_rest(data, *, depth="0-5cm", statistics=("Q0.05","Q0.5","Q0.95"),
+                         properties=("phh2o","soc","nitrogen","clay","sand","silt","bdod","cec"),
+                         source_url="https://rest.isric.org/soilgrids/v2.0/properties/query"):
+    """Parse official point-query GeoJSON. Missing/null predictions are never invented."""
+    if not isinstance(data,dict) or data.get("type")!="Feature":
+        raise ValueError("Unexpected SoilGrids REST response shape")
+    layers=data.get("properties",{}).get("layers")
+    if not isinstance(layers,list) or not layers:
+        raise ValueError("No SoilGrids REST property layers")
+    by_name={layer.get("name"):layer for layer in layers if isinstance(layer,dict)}
+    if len(by_name)!=len(layers):
+        raise ValueError("Duplicate or invalid SoilGrids REST layers")
+    top,bottom=SOILGRIDS_DEPTH[depth]
+    out=[]
+    for prop in properties:
+        layer=by_name.get(prop)
+        if layer is None:
+            raise ValueError(f"Missing SoilGrids REST property {prop}")
+        code,unit,divisor,low,high=SOILGRIDS[prop]
+        depths=[d for d in layer.get("depths",[]) if d.get("label")==depth]
+        if len(depths)!=1:
+            raise ValueError(f"Missing or duplicate SoilGrids REST depth: {prop} {depth}")
+        depth_data=depths[0]
+        rng=depth_data.get("range",{})
+        if (rng.get("top_depth"),rng.get("bottom_depth"),rng.get("unit_depth"))!=(top,bottom,"cm"):
+            raise ValueError("SoilGrids REST depth metadata mismatch")
+        values=depth_data.get("values")
+        if not isinstance(values,dict):
+            raise ValueError("SoilGrids REST statistics unavailable")
+        for stat in statistics:
+            raw=values.get(stat)
+            if raw is None:
+                raise ValueError(f"SoilGrids REST null value: {prop} {depth} {stat}")
+            raw_number=finite_value(raw,0,32767)
+            if raw_number is None:
+                raise ValueError(f"SoilGrids REST invalid raw value: {prop} {stat}")
+            value=finite_value(raw_number/divisor,low,high)
+            if value is None:
+                raise ValueError(f"SoilGrids REST implausible value: {prop} {stat}")
+            out.append(record("ISRIC_SOILGRIDS",code,unit,value,
+                depth_top_cm=top,depth_bottom_cm=bottom,statistic=stat,
+                reference=source_url,metadata={"coverage_id":f"{prop}_{depth}_{stat}",
+                    "native_raw_value":raw_number,"native_divisor":divisor,
+                    "rest_unit_measure":layer.get("unit_measure"),
+                    "ingestion_transport":"REST","modelled_not_measured":True,
+                    "nominal_grid_m":250,"license":"CC-BY-4.0"}))
+    return out
+
+def get_soilgrids_rest(session,lat,lon,depth="0-5cm",
+                       statistics=("Q0.05","Q0.5","Q0.95"),
+                       properties=("phh2o","soc","nitrogen","clay","sand","silt","bdod","cec")):
+    lat,lon=valid_coords(lat,lon)
+    if depth not in SOILGRIDS_DEPTH or not set(statistics).issubset({"Q0.05","Q0.5","Q0.95","mean"}):
+        raise ValueError("Invalid REST depth/statistic")
+    if not set(properties).issubset(SOILGRIDS):
+        raise ValueError("Unknown SoilGrids REST property")
+    # One REST request for all fields; honor the published fair-use rate (5/minute).
+    params=[("lon",lon),("lat",lat)]
+    params += [("property",p) for p in properties]
+    params += [("depth",depth)]
+    params += [("value",s) for s in statistics]
+    res=session.get("https://rest.isric.org/soilgrids/v2.0/properties/query",
+                    params=params,timeout=50)
+    res.raise_for_status()
+    return parse_soilgrids_rest(res.json(),depth=depth,statistics=statistics,
+                               properties=properties,source_url=res.url)
+
 def parse_power(data):
     parameters = data.get("properties",{}).get("parameter",{})
     if not isinstance(parameters,dict):
@@ -381,6 +448,7 @@ def main(argv=None):
     p.add_argument("--start",default="2025-01-01")
     p.add_argument("--end",default="2025-01-07")
     p.add_argument("--depth",default="0-5cm",choices=tuple(SOILGRIDS_DEPTH))
+    p.add_argument("--soilgrids-transport",default="wcs",choices=("wcs","rest"),help="WCS preferred; REST beta may be unavailable")
     p.add_argument("--task-id")
     p.add_argument("--out",default="soil_ingest_report.json")
     p.add_argument("--write",action="store_true")
@@ -396,7 +464,7 @@ def main(argv=None):
         p.error("--land-id required")
     land,lat,lon=load_land(session,url,key,args.land_id)
     if args.provider=="soilgrids":
-        rows=get_soilgrids(session,lat,lon,depth=args.depth)
+        rows=(get_soilgrids_rest(session,lat,lon,depth=args.depth) if args.soilgrids_transport=="rest" else get_soilgrids(session,lat,lon,depth=args.depth))
     elif args.provider=="power":
         rows=get_power(session,lat,lon,args.start,args.end)
     elif args.provider=="smap-submit":
