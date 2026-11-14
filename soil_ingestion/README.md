@@ -67,3 +67,11 @@ All records in a run are validated before any write. For a multiple-batch upsert
 3. Integration staging test must demonstrate actual tenant guard failures, duplicate upsert idempotency, and read restrictions for `anon` and `authenticated` roles.
 4. Secrets, monitoring, rate limits, retry/backoff, batching, quality gates and operational ownership must be approved before automated nationwide ingestion.
 5. Never convert `GWETTOP` or `GWETROOT` wetness fractions into volumetric moisture without a validated relationship; do not train or infer available fertilizer NPK from SoilGrids total N.
+
+## Verified production-database source ingestion (2026-11-15)
+
+One authorized source-data canary was executed at the coordinates of an existing active land, with a live HTTPS response from NASA POWER. Nine **real modelled daily wetness fractions**, covering 2026-10-01 through 2026-10-03, were upserted to `public.soil_source_observations`. Provider payload explicitly identified source products `MERRA2` and `GEOSIT`, `time_standard=UTC`, and parameter units `1` (fraction). Readback confirmed exactly 9 records, 9 distinct keys, one land, and source product metadata. The original `soil_health` remained at 36 rows.
+
+The canary used an internal SQL integration path, not the CLI's credentialed write path. The CLI's write path remains **unit-tested but not live-tested end to end**. This is not proof of correctness for all lands, providers, or crop decisions. The dataset's spatial grid is much coarser than typical smallholder farm boundaries.
+
+Do not display NASA `GWET*` numbers as volumetric moisture percentages, nor label them as measured by farm sensors.
