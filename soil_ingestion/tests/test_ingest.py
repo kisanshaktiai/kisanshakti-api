@@ -199,3 +199,46 @@ def test_nasa_power_unexpected_fill_value_refused():
       "GWETPROF":{"20261001":-888}}}}
     with pytest.raises(ValueError,match="fill-value"):
         parse_power(data)
+
+def test_rest_properties_are_scaled_and_source_labelled():
+    from soil_ingestion.ingest import parse_soilgrids_rest
+    data={"type":"Feature","properties":{"layers":[
+      {"name":"phh2o","unit_measure":{"d_factor":10},
+       "depths":[{"range":{"top_depth":0,"bottom_depth":5,"unit_depth":"cm"},
+                  "label":"0-5cm","values":{"Q0.05":59,"Q0.5":65,"Q0.95":73}}]}
+    ]}}
+    rows=parse_soilgrids_rest(data,properties=("phh2o",))
+    assert [r["value"] for r in rows]==[5.9,6.5,7.3]
+    assert all(r["source_metadata"]["ingestion_transport"]=="REST" for r in rows)
+    assert all(r["unit"]=="pH" for r in rows)
+    assert all(r["observed_at"] is None for r in rows)
+
+def test_rest_null_is_not_fabricated():
+    from soil_ingestion.ingest import parse_soilgrids_rest
+    data={"type":"Feature","properties":{"layers":[
+      {"name":"phh2o","depths":[{"range":{"top_depth":0,"bottom_depth":5,"unit_depth":"cm"},
+                  "label":"0-5cm","values":{"Q0.5":None}}]}
+    ]}}
+    with pytest.raises(ValueError,match="null value"):
+        parse_soilgrids_rest(data,statistics=("Q0.5",),properties=("phh2o",))
+
+def test_rest_rejects_inconsistent_depth():
+    from soil_ingestion.ingest import parse_soilgrids_rest
+    data={"type":"Feature","properties":{"layers":[
+      {"name":"phh2o","depths":[{"range":{"top_depth":10,"bottom_depth":15,"unit_depth":"cm"},
+                  "label":"0-5cm","values":{"Q0.5":65}}]}
+    ]}}
+    with pytest.raises(ValueError,match="depth metadata mismatch"):
+        parse_soilgrids_rest(data,statistics=("Q0.5",),properties=("phh2o",))
+
+def test_rest_only_one_request_with_repeated_property_keys():
+    from soil_ingestion.ingest import get_soilgrids_rest
+    d={"type":"Feature","properties":{"layers":[
+        {"name":"phh2o","depths":[{"range":{"top_depth":0,"bottom_depth":5,"unit_depth":"cm"},
+                                  "label":"0-5cm","values":{"Q0.5":65}}]}]}}
+    session=Session([Response(d,url="https://rest.isric.org/soilgrids/v2.0/properties/query?lon=73&lat=18")])
+    rows=get_soilgrids_rest(session,18.5,73.8,statistics=("Q0.5",),properties=("phh2o",))
+    assert rows[0]["value"]==6.5
+    assert len(session.calls)==1
+    assert session.calls[0][2]["params"]==[
+       ("lon",73.8),("lat",18.5),("property","phh2o"),("depth","0-5cm"),("value","Q0.5")]
