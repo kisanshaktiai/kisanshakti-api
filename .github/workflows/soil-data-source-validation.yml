@@ -15,5 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install geospatial parser for real raster verification
+        run: python -m pip install rasterio==1.5.0 pyproj==3.7.2
       - name: Test SoilGrids NASA POWER and AppEEARS public endpoints
         run: python soil_validation/live_smoke_probe.py
