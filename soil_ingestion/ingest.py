@@ -255,13 +255,26 @@ def parse_smap_csv(blob, task_id):
                           "modelled_not_field_measured":True,"nominal_grid_m":9000}))
     return out
 
-def appeears_fetch(session,task_id):
+def appeears_fetch(session,task_id,expected_lat,expected_lon):
+    """Never attach a finished NASA task to another land's coordinates."""
+    expected_lat, expected_lon = valid_coords(expected_lat, expected_lon)
     if not re.fullmatch(r"[0-9a-fA-F-]{36}",task_id):
         raise ValueError("Invalid task ID")
     headers={"Authorization":"Bearer "+appeears_token(session)}
     task=session.get(f"{APPEEARS_URL}/task/{task_id}",headers=headers,timeout=45)
     task.raise_for_status()
-    status=task.json().get("status")
+    task_data=task.json()
+    coords=task_data.get("params",{}).get("coordinates",[])
+    if not isinstance(coords,list) or len(coords)!=1:
+        raise ValueError("NASA task has no uniquely verifiable target coordinate")
+    point=coords[0]
+    try:
+        returned_lat,returned_lon=valid_coords(float(point["latitude"]),float(point["longitude"]))
+    except (KeyError,TypeError,ValueError) as ex:
+        raise ValueError("NASA task coordinates unavailable") from ex
+    if abs(returned_lat-expected_lat)>0.000001 or abs(returned_lon-expected_lon)>0.000001:
+        raise PermissionError("NASA task coordinates differ from the registered land")
+    status=task_data.get("status")
     if status!="done":
         return {"status":status,"records":[]}
     res=session.get(f"{APPEEARS_URL}/bundle/{task_id}",headers=headers,timeout=45)
@@ -391,7 +404,7 @@ def main(argv=None):
     else:
         if not args.task_id:
             p.error("--task-id is required for smap-fetch")
-        result=appeears_fetch(session,args.task_id)
+        result=appeears_fetch(session,args.task_id,lat,lon)
         if result["status"]!="done":
             print(json.dumps({"status":result["status"],"writes":0}))
             return 2
