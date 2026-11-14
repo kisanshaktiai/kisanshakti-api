@@ -49,6 +49,11 @@ def main():
                             x,y=Transformer.from_crs("EPSG:4326",ds.crs,always_xy=True).transform(73.8567,18.5204)
                             sample=list(ds.sample([(x,y)],masked=True))[0][0]
                             d["pixel_masked"]=bool(getattr(sample,"mask",False))
+                            d["point_projected"]=[round(x,2),round(y,2)]
+                            d["raster_bounds"]=list(ds.bounds)
+                            d["in_raster"]=ds.bounds.left <= x < ds.bounds.right and ds.bounds.bottom < y <= ds.bounds.top
+                            d["nodata"]=ds.nodata
+                            d["min_max"]=[float(ds.read(1).min()),float(ds.read(1).max())]
                             if not d["pixel_masked"]:
                                 d["raw_ph"]=float(sample)
                                 d["estimated_ph"]=float(sample)/10.0
