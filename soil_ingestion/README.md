@@ -10,7 +10,7 @@
 | NASA POWER | daily point API, `community=AG` | `GWETTOP`, `GWETROOT`, `GWETPROF` | **relative wetness fractions** only, NOT volumetric moisture or SMAP measurements |
 | NASA SMAP Level 4 V8 | AppEEARS authenticated point task | surface/root-zone volumetric moisture | 9 km model assimilation, not measured field moisture; asynchronous tasks |
 
-The NASA POWER `SFMC` and `RZMC` request produced `-999` for the tested India location across several date ranges. Those properties are NOT enabled in this importer. ISRIC WCS returned an invalid all-zero pH raster for an illustrative Pune point; this importer rejects invalid layers and the test location must not be presented as a real soil report.
+The NASA POWER `SFMC` and `RZMC` request produced `-999` for the tested India location across several date ranges. Those properties are NOT enabled in this importer. ISRIC REST returned null pH for an illustrative Pune-city point, while WCS returned all-zero pixels there. At separate rural Maharashtra test points, both services returned valid pH predictions. The importer rejects unavailable values without replacing them with regional defaults.
 
 ## Existing tables checked
 
@@ -66,7 +66,7 @@ All records in a run are validated before any write. For a multiple-batch upsert
 
 ## Release blockers
 
-1. SoilGrids WCS must return valid nonzero readings for actual Indian test coordinates, with checked nodata handling and independent cross-validation.
+1. Live SoilGrids REST and WCS retrieval succeeded for illustrative rural Maharashtra coordinates, but exact pixel consistency, urban no-data handling, all requested depths, availability and independent field validation must still be audited.
 2. NASA SMAP authenticated AppEEARS task must be tested against a real result bundle, including timestamp and accepted CSV column schema, and missing data.
 3. Integration staging test must demonstrate actual tenant guard failures, duplicate upsert idempotency, and read restrictions for `anon` and `authenticated` roles.
 4. Secrets, monitoring, rate limits, retry/backoff, batching, quality gates and operational ownership must be approved before automated nationwide ingestion.
@@ -88,3 +88,9 @@ Do not display NASA `GWET*` numbers as volumetric moisture percentages, nor labe
 - WCS remains primary. REST is ISRIC beta, documented temporary outages and 5 requests/minute fair-use limit. Query multiple properties/quantiles in one REST call. No automatic fallback that converts missing properties to defaults.
 - A zero pH response for the urban Pune validation point corresponded to a null REST pH; rural Maharashtra test sites returned valid predictions. Treat absent/invalid pixels as missing, not measured zeros.
 - Values are *predicted* and not laboratory observations. Still cannot infer available phosphorus or potassium from SoilGrids.
+
+### Live verification: official REST and WCS (2026-11-15)
+
+A read-only GitHub Actions run returned **24 validated SoilGrids REST estimates**, covering eight soil properties × Q0.05/Q0.5/Q0.95 at 0–5 cm for illustrative latitude 16.75, longitude 74.20. Examples: median pH=6.5, SOC=1.27%, total nitrogen=1.1 g/kg, clay=20.4%, sand=40.4%, silt=16.9%, bulk density=1.40 g/cm3, CEC=20.4 cmol(+)/kg. The WCS returned pH 6.6 for the same geographical point; that difference is still being investigated. No SoilGrids data were written to Supabase during this test.
+
+The linked classification endpoint returned Vertisols as the highest-probability class for the illustrative Kolhapur-area location, with 31% class probability. Soil classes are not stored as pH/chemical values. Temporary diagnostic scripts/workflows were removed after live verification; the core REST parser and regression tests remain in the branch.
