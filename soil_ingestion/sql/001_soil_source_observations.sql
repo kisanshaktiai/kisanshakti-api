@@ -57,3 +57,28 @@ REVOKE ALL ON TABLE public.soil_source_observations FROM PUBLIC, anon, authentic
 GRANT SELECT, INSERT, UPDATE ON TABLE public.soil_source_observations TO service_role;
 -- No SELECT policy for app roles. Only trusted ingestion service may import.
 -- Upsert conflict target: record_key. NEVER insert into soil_health from this pipeline.
+
+-- Enforce tenant and coordinate binding inside Postgres, not only in the client.
+CREATE OR REPLACE FUNCTION public.soil_source_observation_guard()
+RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path TO 'public'
+AS $$
+DECLARE target_tenant uuid; lat numeric; lon numeric;
+BEGIN
+  SELECT l.tenant_id, l.center_lat, l.center_lon
+    INTO target_tenant, lat, lon FROM public.lands l WHERE l.id=NEW.land_id;
+  IF NOT FOUND OR target_tenant IS DISTINCT FROM NEW.tenant_id THEN
+    RAISE EXCEPTION 'Soil observation land/tenant mismatch';
+  END IF;
+  IF lat IS NULL OR lon IS NULL OR
+     abs(lat - NEW.requested_lat)>0.000001 OR
+     abs(lon - NEW.requested_lon)>0.000001 THEN
+    RAISE EXCEPTION 'Soil observation coordinates do not match land centroid';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.soil_source_observation_guard() FROM PUBLIC, anon, authenticated;
+DROP TRIGGER IF EXISTS trg_soil_source_guard ON public.soil_source_observations;
+CREATE TRIGGER trg_soil_source_guard
+BEFORE INSERT OR UPDATE ON public.soil_source_observations
+FOR EACH ROW EXECUTE FUNCTION public.soil_source_observation_guard();
