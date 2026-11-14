@@ -424,6 +424,11 @@ def main(argv=None):
 if __name__=="__main__":
     try:
         sys.exit(main())
-    except Exception as e:
-        print(f"INGEST ERROR: {type(e).__name__}: {e}",file=sys.stderr)
+    except requests.RequestException as exc:
+        # Public GitHub Actions logs must not expose farmer GPS in URL query strings.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        print(f"INGEST HTTP ERROR: {type(exc).__name__}, status={status}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"INGEST ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         sys.exit(1)
