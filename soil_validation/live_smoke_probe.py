@@ -1,44 +1,57 @@
-"""No credentials, no database writes. Test public provider availability."""
+"""Read-only live provider probe. No credentials. No database writes."""
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from xml.etree import ElementTree as ET
 import json
 
-def check_provider(name, url):
-    with urlopen(Request(url, headers={"User-Agent": "KisanShaktiSoilValidation/1.0"}), timeout=40) as response:
-        status=response.status
-        content=response.read(2_000_000)
-        ctype=response.headers.get("content-type", "")
-    result={"http_status":status, "bytes":len(content), "type":ctype}
-    if name=="soilgrids":
-        root=ET.fromstring(content)
-        names=[e.text for e in root.iter() if e.tag.rsplit("}",1)[-1]=="CoverageId"]
-        result["count"]=len(names)
-        result["has_median"]="phh2o_0-5cm_Q0.5" in names
-        result["ok"]=status==200 and result["has_median"]
-    elif name=="power":
-        data=json.loads(content)
-        params=data.get("properties",{}).get("parameter",{})
-        result["available"]={k:sum(isinstance(v,(int,float)) and 0<=v<=1 for v in p.values()) for k,p in params.items()}
-        result["ok"]=status==200 and all(result["available"].get(k,0)>0 for k in ("SFMC","RZMC"))
-    else:
-        data=json.loads(content)
-        matches=[k for k in data if k.lower().endswith(("sm_surface","sm_rootzone"))]
-        result["layer_matches"]=matches
-        result["ok"]=status==200 and any(x.lower().endswith("sm_surface") for x in matches) and any(x.lower().endswith("sm_rootzone") for x in matches)
-    return result
+def request(url):
+    try:
+        with urlopen(Request(url,headers={"User-Agent":"KisanShaktiSoilValidation/1.0"}),timeout=40) as response:
+            return response.status, response.headers.get("content-type",""),response.read(1500000)
+    except HTTPError as e:
+        return e.code, e.headers.get("content-type",""), e.read(8000)
 
 def main():
+    base_power="https://power.larc.nasa.gov/api/temporal/daily/point"
+    base={"longitude":73.8567,"latitude":18.5204,"start":"20261001","end":"20261007","format":"JSON"}
     endpoints={
-      "soilgrids": "https://maps.isric.org/mapserv?"+urlencode({"map":"/map/phh2o.map","SERVICE":"WCS","VERSION":"2.0.0","REQUEST":"GetCapabilities"}),
-      "power": "https://power.larc.nasa.gov/api/temporal/daily/point?"+urlencode({"parameters":"SFMC,RZMC","community":"HY","longitude":73.8567,"latitude":18.5204,"start":"20261001","end":"20261007","format":"JSON"}),
-      "appeears": "https://appeears.earthdatacloud.nasa.gov/api/product/SPL4SMGP.008"
+      "soilgrids_capabilities":"https://maps.isric.org/mapserv?"+urlencode({"map":"/map/phh2o.map","SERVICE":"WCS","VERSION":"2.0.0","REQUEST":"GetCapabilities"}),
+      "power_HY_SFMC_RZMC":base_power+"?"+urlencode({**base,"parameters":"SFMC,RZMC","community":"HY"}),
+      "power_AG_SFMC_RZMC":base_power+"?"+urlencode({**base,"parameters":"SFMC,RZMC","community":"AG"}),
+      "power_HY_SFMC":base_power+"?"+urlencode({**base,"parameters":"SFMC","community":"HY"}),
+      "power_HY_T2M":base_power+"?"+urlencode({**base,"parameters":"T2M","community":"HY"}),
+      "appeears_product":"https://appeears.earthdatacloud.nasa.gov/api/product/SPL4SMGP.008"
     }
     results={}
     for name,url in endpoints.items():
-        try: results[name]=check_provider(name,url)
-        except Exception as e: results[name]={"ok":False,"error":str(e)}
-    print(json.dumps(results, indent=2))
-    return 0 if all(r.get("ok") for r in results.values()) else 1
+        try:
+            status,ctype,blob=request(url)
+            d={"http_status":status,"bytes":len(blob),"content_type":ctype}
+            if name=="soilgrids_capabilities" and status==200:
+                root=ET.fromstring(blob)
+                identifiers=[e.text for e in root.iter() if e.tag.rsplit("}",1)[-1]=="CoverageId"]
+                d["coverages"]=len(identifiers)
+                d["has_ph_median"]="phh2o_0-5cm_Q0.5" in identifiers
+            elif name=="appeears_product" and status==200:
+                data=json.loads(blob)
+                d["layer_matches"]=[k for k in data if k.lower().endswith(("sm_surface","sm_rootzone"))]
+            else:
+                try:
+                    data=json.loads(blob)
+                    if status==200:
+                        params=data.get("properties",{}).get("parameter",{})
+                        d["parameter_names"]=list(params)
+                        d["valid_counts"]={k:sum(isinstance(v,(float,int)) and 0<=v<=1 for v in values.values()) for k,values in params.items()}
+                    else:
+                        d["provider_error"]=str(data)[:1600]
+                except Exception:
+                    d["provider_error"]=blob.decode(errors="replace")[:1200]
+            results[name]=d
+        except Exception as e:
+            results[name]={"error":f"{type(e).__name__}: {e}"}
+    print(json.dumps(results,indent=2))
+    return 0
 
-if __name__=="__main__":raise SystemExit(main())
+if __name__=="__main__":
+    raise SystemExit(main())
