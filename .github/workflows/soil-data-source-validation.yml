@@ -1,0 +1,19 @@
+name: Soil source live validation (read only)
+on:
+  push:
+    branches:
+      - soil-data-provider-validation-20261114
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  live-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test SoilGrids NASA POWER and AppEEARS public endpoints
+        run: python soil_validation/live_smoke_probe.py
