@@ -23,6 +23,14 @@ def main():
       "power_AG_SFMC_RZMC_2025":base_power+"?"+urlencode({**base,"start":"20250101","end":"20250107","parameters":"SFMC,RZMC","community":"AG"}),
       "power_HY_SFMC":base_power+"?"+urlencode({**base,"parameters":"SFMC","community":"HY"}),
       "power_HY_T2M":base_power+"?"+urlencode({**base,"parameters":"T2M","community":"HY"}),
+      "power_AG_GWET_2025":base_power+"?"+urlencode({**base,"start":"20250101","end":"20250107","parameters":"GWETTOP,GWETROOT","community":"AG"}),
+      "soilgrids_getcoverage":"https://maps.isric.org/mapserv?"+urlencode([
+        ("map","/map/phh2o.map"),("SERVICE","WCS"),("VERSION","2.0.1"),
+        ("REQUEST","GetCoverage"),("COVERAGEID","phh2o_0-5cm_Q0.5"),
+        ("FORMAT","GEOTIFF_INT16"),("SUBSET","X(7968349,7969349)"),
+        ("SUBSET","Y(2061181,2062181)"),
+        ("SUBSETTINGCRS","http://www.opengis.net/def/crs/EPSG/0/152160"),
+        ("OUTPUTCRS","http://www.opengis.net/def/crs/EPSG/0/152160")]),
       "appeears_product":"https://appeears.earthdatacloud.nasa.gov/api/product/SPL4SMGP.008"
     }
     results={}
@@ -30,7 +38,10 @@ def main():
         try:
             status,ctype,blob=request(url)
             d={"http_status":status,"bytes":len(blob),"content_type":ctype}
-            if name=="soilgrids_capabilities" and status==200:
+            if name=="soilgrids_getcoverage":
+                d["first_bytes"]=repr(blob[:24]);d["looks_like_tiff"]=blob[:4] in (b"II*\\x00",b"MM\\x00*")
+                if not d["looks_like_tiff"]:d["provider_error"]=blob[:500].decode(errors="replace")
+            elif name=="soilgrids_capabilities" and status==200:
                 root=ET.fromstring(blob)
                 identifiers=[e.text for e in root.iter() if e.tag.rsplit("}",1)[-1]=="CoverageId"]
                 d["coverages"]=len(identifiers)
