@@ -1,0 +1,66 @@
+name: Manually validate one soil-data land (protected)
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Provider to test
+        required: true
+        type: choice
+        options:
+          - power
+          - soilgrids
+          - smap-submit
+          - smap-fetch
+      write:
+        description: Write validated observations to isolated soil_source_observations (requires repository variable + secret)
+        required: true
+        default: false
+        type: boolean
+      task_id:
+        description: Existing authenticated SMAP task UUID, if fetching
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  guarded-soil-import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    environment: soil-staging
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      APPEEARS_TOKEN: ${{ secrets.APPEEARS_TOKEN }}
+      SOIL_TEST_LAND_ID: ${{ secrets.SOIL_TEST_LAND_ID }}
+      SOIL_INGEST_WRITE_ENABLED: ${{ vars.SOIL_INGEST_WRITE_ENABLED }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install isolated soil dependencies
+        run: python -m pip install -r soil_ingestion/requirements.txt
+      - name: Verify automated tests
+        run: python -m pytest -q soil_ingestion/tests
+      - name: Guard all secret-dependent operations
+        run: |
+          test -n "$SUPABASE_URL" && test -n "$SUPABASE_SERVICE_ROLE_KEY" && test -n "$SOIL_TEST_LAND_ID"
+          if [ "${{ inputs.write }}" = "true" ]; then
+            test "$SOIL_INGEST_WRITE_ENABLED" = "yes"
+          fi
+      - name: Run source-verified ingestion for protected test land
+        shell: bash
+        env:
+          SOURCE: ${{ inputs.provider }}
+          TASK: ${{ inputs.task_id }}
+          WRITE_REQUESTED: ${{ inputs.write }}
+        run: |
+          set -euo pipefail
+          ARGS=(--land-id "$SOIL_TEST_LAND_ID" --provider "$SOURCE" --start 2025-01-01 --end 2025-01-07 --out /tmp/soil_import_result.json)
+          if [ "$SOURCE" = "smap-fetch" ]; then
+            test -n "$TASK"
+            ARGS+=(--task-id "$TASK")
+          fi
+          if [ "$WRITE_REQUESTED" = "true" ]; then ARGS+=(--write); fi
+          python -m soil_ingestion.ingest "${ARGS[@]}"
+          # Output data are intentionally not uploaded as public CI artifacts.

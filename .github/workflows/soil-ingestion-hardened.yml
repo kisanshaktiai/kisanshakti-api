@@ -1,0 +1,32 @@
+name: Soil ingestion hardened CI
+on:
+  push:
+    branches:
+      - soil-ingestion-hardened-20261115
+  pull_request:
+    paths:
+      - 'soil_ingestion/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned dependencies
+        run: python -m pip install -r soil_ingestion/requirements.txt
+      - name: Validate source-code compilation
+        run: python -m compileall -q soil_ingestion
+      - name: Run validation tests
+        run: python -m pytest -q soil_ingestion/tests
+      - name: Verify no legacy soil_health write exists
+        run: |
+          if grep -R -E '"/soil_health"|\x27/soil_health\x27|update public.soil_health|insert into public.soil_health' soil_ingestion/ingest.py; then
+            echo 'Unexpected legacy soil_health write path'
+            exit 1
+          fi
