@@ -6,8 +6,8 @@ from urllib.error import HTTPError
 from pyproj import Transformer
 from rasterio.io import MemoryFile
 
-POINTS={"pune_city":(18.5204,73.8567),"farm_1":(16.87055939,74.17841752),
-        "farm_2":(16.87444229,74.16828477),"rural_maharashtra":(19.215,75.45)}
+POINTS={"pune_city":(18.5204,73.8567),"kolhapur_sample":(16.75,74.2),
+        "sangli_sample":(16.9,74.6),"rural_maharashtra":(19.215,75.45)}
 BASE="https://rest.isric.org/soilgrids/v2.0"
 WCS="https://maps.isric.org/mapserv"
 crs="http://www.opengis.net/def/crs/EPSG/0/152160"
