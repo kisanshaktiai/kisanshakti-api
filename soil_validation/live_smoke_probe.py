@@ -43,6 +43,12 @@ def main():
         ("SUBSET","X(-1550500,-1549500)"),("SUBSET","Y(1619500,1620500)"),
         ("SUBSETTINGCRS","http://www.opengis.net/def/crs/EPSG/0/152160"),
         ("OUTPUTCRS","http://www.opengis.net/def/crs/EPSG/0/152160")]),
+      "soilgrids_pune_latlon":"https://maps.isric.org/mapserv?"+urlencode([
+        ("map","/map/phh2o.map"),("SERVICE","WCS"),("VERSION","2.0.1"),("REQUEST","GetCoverage"),
+        ("COVERAGEID","phh2o_0-5cm_Q0.5"),("FORMAT","GEOTIFF_INT16"),
+        ("SUBSET","X(73.851,73.862)"),("SUBSET","Y(18.515,18.526)"),
+        ("SUBSETTINGCRS","http://www.opengis.net/def/crs/EPSG/0/4326"),
+        ("OUTPUTCRS","http://www.opengis.net/def/crs/EPSG/0/4326")]),
       "appeears_product":"https://appeears.earthdatacloud.nasa.gov/api/product/SPL4SMGP.008"
     }
     results={}
